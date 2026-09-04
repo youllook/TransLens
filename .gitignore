@@ -1,0 +1,11 @@
+# 本機設定（含透鏡位置、可能含 API key）— 請用 config.example.json
+config.json
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,22 @@
+{
+  "engine": "ocr_google",
+  "ocr_lang": "auto",
+  "target_lang": "zh-TW",
+  "hotkey_translate": "ctrl+alt+t",
+  "hotkey_toggle": "ctrl+alt+h",
+  "auto_interval_sec": 3,
+  "show_original": true,
+  "font_size": 15,
+  "font_family": "Microsoft JhengHei UI",
+  "panel_alpha": 0.92,
+  "border_color": "#00b8a9",
+  "gemini_model": "gemini-2.5-flash",
+  "gemini_cli_model": "",
+  "claude_model": "claude-opus-5",
+  "geometry": {
+    "x": 100,
+    "y": 100,
+    "w": 480,
+    "h": 260
+  }
+}

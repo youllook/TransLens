@@ -1,0 +1,5 @@
+pillow>=10
+requests>=2.31
+winsdk>=1.0
+# 選用：Claude 引擎
+# anthropic>=1.0
