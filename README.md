@@ -126,16 +126,22 @@ Windows 系統聲音（WASAPI loopback）
   → 16kHz 單聲道 WAV
   → POST 到區網 Mac 上的 whisper-server（whisper.cpp，large-v3-turbo）
   → 幻聽過濾
-  → Google 翻譯 → 面板顯示「中文 / 原文」
+  → 翻譯（預設：區網本地 LLM；連不上才退到 Google）→ 面板顯示「中文 / 原文」
 ```
 
 語音辨識**不在這台 Windows 上跑**，而是丟給區網另一台機器的 whisper-server，
 所以這台電腦幾乎不吃 CPU，也不需要裝 CUDA 或大型模型。
 
+**翻譯也可以留在區網**：預設 `translator` 為 `local`，辨識出的文字會送到區網自己的
+LLM（本專案用 Mac mini 上的 [oMLX](https://github.com/jundot/omlx) 跑 Qwen2.5-7B-Instruct-4bit），
+**整條管線的文字都不出門**。本地 LLM 連不上、逾時或回空時會自動退回 Google，
+並在狀態列標示「本地失敗」。設定見下方「翻譯來源」。
+
 **需要準備**
 
 1. 一台跑 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server` 的機器（本專案用區網的 Mac mini M4）。
    安裝與 launchd 常駐設定見 [`docs/mac/README.md`](docs/mac/README.md)。
+   同一台也可以跑 oMLX 提供本地翻譯（同上文件），不想自架就把 `translator` 設成 `google`。
 2. 這台 Windows 安裝擷取套件：`pip install pyaudiowpatch`
    （**沒裝不影響原本的 OCR 翻譯**，只是勾「🎧字幕」時會提示要安裝）。
 3. 這台 Windows 要有**啟用中的音訊輸出裝置**（喇叭或耳機）。loopback 是「錄下正在播放的聲音」，
@@ -152,6 +158,24 @@ Windows 系統聲音（WASAPI loopback）
 | `subtitle_hold_sec` | `8` | 字幕在面板上停留幾秒後清空 |
 
 `audio_lang` 指定成 `ja` 或 `en` 會比 `auto` 快一點也穩一點；語言會混的內容才用 `auto`。
+
+**翻譯來源**（OCR 與音訊字幕共用，⚙ → 翻譯來源 可即時切換）
+
+| 鍵 | 預設 | 意義 |
+|---|---|---|
+| `translator` | `local` | `local` = 區網本地 LLM（文字不出門）；`google` = 免金鑰 Google 端點 |
+| `local_llm_url` | `http://192.168.0.49:8000/v1` | OpenAI 相容端點（結尾有沒有 `/v1` 都吃） |
+| `local_llm_model` | `Qwen2.5-7B-Instruct-4bit` | 模型名稱 |
+| `local_llm_api_key` | `""` | 伺服器 api key；**環境變數 `OMLX_API_KEY` 優先**，不想寫進設定檔就用它 |
+| `local_llm_timeout_sec` | `20` | 單次請求逾時；逾時就退到 Google |
+
+實測（Mac mini M4 / Qwen2.5-7B-4bit）一句字幕翻譯約 **0.9～2.3 秒**，與 Google 的 0.1～1.7 秒
+在觀看體感上差不多，但語氣與台灣用語明顯較自然（例如 `Watch your step` → 本地「小心腳步」、
+Google「注意你的腳步」）。
+
+> Qwen 這類模型即使被要求只准繁體，仍會在少數詞固定吐簡體（實測「早点回家」的「点」必現），
+> 所以譯文一律再過一次簡→繁轉換：有裝 `opencc` 就用它，沒裝則用內建常用字對照表兜底。
+> 想要最完整的轉換可自行 `pip install opencc-python-reimplemented`。
 
 **限制**
 
@@ -186,6 +210,8 @@ Windows 系統聲音（WASAPI loopback）
 | `claude_model` | Claude API 引擎用的模型名 |
 | `whisper_server_url` | 音訊字幕的 whisper-server 端點（見「音訊字幕」） |
 | `audio_lang` | 音訊字幕辨識語言：`auto` / `ja` / `en` |
+| `translator` | 翻譯來源：`local`（區網 LLM，預設）/ `google`（見「音訊字幕 → 翻譯來源」） |
+| `local_llm_url` / `local_llm_model` / `local_llm_api_key` / `local_llm_timeout_sec` | 本地 LLM 連線設定；api key 建議改用環境變數 `OMLX_API_KEY` |
 | `audio_silence_sec` | 靜音多久算一句結束（秒） |
 | `audio_max_chunk_sec` | 單段最長秒數，超過就強制切開 |
 | `subtitle_hold_sec` | 字幕停留幾秒後清空面板 |
@@ -201,7 +227,7 @@ Windows 系統聲音（WASAPI loopback）
 | **Gemini API** | 透鏡框內的**截圖**（PNG）送到 Google Generative Language API。 |
 | **Claude API** | 透鏡框內的**截圖**（PNG）送到 Anthropic API。 |
 | **Gemini CLI** | 截圖存到暫存目錄交給本機 `gemini` CLI，由 CLI 上傳到 Google；完成後暫存目錄即刪除。 |
-| **🎧音訊字幕** | 系統聲音的片段（WAV）送到**你自己指定的** whisper-server（預設是區網內的機器，不經過任何雲端）；辨識出的**文字**再送到 Google 翻譯。 |
+| **🎧音訊字幕** | 系統聲音的片段（WAV）送到**你自己指定的** whisper-server（預設是區網內的機器，不經過任何雲端）；辨識出的**文字**在 `translator=local`（預設）時只送到**你自己區網的 LLM**，**完全不出外網**；只有在本地 LLM 連不上而自動退版、或手動選 `google` 時，文字才會送到 Google 翻譯。 |
 
 除此之外沒有任何遙測、沒有帳號、沒有雲端設定。設定與紀錄都只在同目錄的 `config.json` 和 `translens.log`。
 
@@ -209,7 +235,8 @@ Windows 系統聲音（WASAPI loopback）
 
 - 只支援 Windows（依賴 Windows.Media.Ocr 與 Win32 全域快捷鍵）。
 - 遊戲若為「獨佔全螢幕」，任何覆蓋視窗都不會顯示；請改用「無邊框視窗」或「視窗化」。
-- Google 免金鑰翻譯是非官方端點，短時間大量請求可能被限流（程式會自動退到備援端點）。
+- Google 免金鑰翻譯是非官方端點，短時間大量請求**可能被限流（HTTP 429）**（程式會自動退到備援端點）。
+  音訊字幕是「每句話打一次」，最容易踩到；把 `translator` 留在預設的 `local` 走區網 LLM 就完全沒這個問題。
 - 結果面板若被拖到透鏡框內，截圖瞬間會先隱藏面板以免翻到自己的譯文。
 - 音訊字幕需要另一台機器跑 whisper-server，且本機要有啟用中的音訊輸出裝置（詳見「音訊字幕」一節）。
 
@@ -232,8 +259,11 @@ engines/gemini_api.py        Gemini API 直連
 engines/gemini_cli.py        Gemini CLI 無頭模式
 engines/claude_api.py        Claude API
 engines/audio_subtitle.py    音訊字幕（WASAPI loopback → whisper-server → 翻譯）
+engines/translator.py        翻譯統一入口（本地 LLM，失敗退 Google）
+engines/translate_local.py   區網本地 LLM 翻譯（OpenAI 相容端點）
 tests/test_audio_subtitle.py 音訊字幕管線測試
-docs/mac/                    Mac 上 whisper-server 的 launchd 常駐設定
+tests/test_translator.py     翻譯入口與本地 LLM 測試
+docs/mac/                    Mac 上 whisper-server 與 oMLX 的 launchd 常駐設定
 assets/make_icon.py          用 Pillow 程式化繪製圖示，重跑即可重生 translens.ico / .png
 run.bat                      啟動器（缺套件自動安裝）
 make_shortcut.ps1            建立桌面捷徑
@@ -306,17 +336,23 @@ Windows system audio (WASAPI loopback)
   → 16 kHz mono WAV
   → POST to whisper-server on the LAN (whisper.cpp, large-v3-turbo)
   → hallucination filter
-  → Google Translate → panel shows translation + original
+  → translation (local LAN LLM by default; falls back to Google) → panel shows translation + original
 ```
 
 Speech recognition does **not** run on this Windows box — it is offloaded to another machine on your LAN,
 so there is no CUDA setup and almost no local CPU cost.
 
+**Translation can stay on your LAN too.** `translator` defaults to `local`, sending the transcribed text to
+your own LLM (this project runs Qwen2.5-7B-Instruct-4bit under [oMLX](https://github.com/jundot/omlx) on the
+same Mac mini), so **no text ever leaves your network**. If the local LLM is unreachable, times out, or
+returns nothing, it falls back to Google automatically and the status bar says so.
+
 **What you need**
 
 1. A machine running [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server`
    (this project uses a Mac mini M4 on the LAN). See [`docs/mac/README.md`](docs/mac/README.md)
-   for the launchd service setup.
+   for the launchd service setup. The same box can host oMLX for local translation (same doc);
+   set `translator` to `google` if you would rather not run one.
 2. `pip install pyaudiowpatch` on this Windows machine. **Without it, OCR translation is entirely unaffected** —
    ticking "🎧字幕" just tells you to install it.
 3. An **active audio output device** (speakers or headphones). Loopback records what is being *played*,
@@ -334,6 +370,25 @@ so there is no CUDA setup and almost no local CPU cost.
 
 Pinning `audio_lang` to `ja` or `en` is slightly faster and more reliable than `auto`.
 
+**Translation backend** (shared by OCR and audio subtitles; switch live under ⚙ → 翻譯來源)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `translator` | `local` | `local` = LLM on your LAN (text never leaves); `google` = keyless Google endpoints |
+| `local_llm_url` | `http://192.168.0.49:8000/v1` | OpenAI-compatible endpoint (trailing `/v1` optional) |
+| `local_llm_model` | `Qwen2.5-7B-Instruct-4bit` | Model name |
+| `local_llm_api_key` | `""` | Server API key. **`OMLX_API_KEY` env var takes precedence** — use it to keep the key out of the config file |
+| `local_llm_timeout_sec` | `20` | Per-request timeout; on timeout it falls back to Google |
+
+Measured on a Mac mini M4 with Qwen2.5-7B-4bit: **0.9–2.3 s** per subtitle line versus 0.1–1.7 s for Google —
+close enough in practice, and the tone and Taiwanese wording are noticeably better
+(`Watch your step` → local "小心腳步" vs Google "注意你的腳步").
+
+> Even when told to emit Traditional Chinese only, Qwen-class models still leak a few Simplified characters
+> (in testing, the 点 in 早点回家 appeared every single time). Output therefore always goes through a
+> Simplified→Traditional pass: `opencc` if installed, otherwise a small built-in table.
+> For the most complete conversion, `pip install opencc-python-reimplemented`.
+
 **Limitations**
 
 - Latency is roughly **2–4 s**: a sentence must finish (0.6 s of silence) before it is sent, plus ~1–1.5 s
@@ -350,13 +405,13 @@ Pinning `audio_lang` to `ja` or `en` is slightly faster and more reliable than `
 - **OCR+Google**: the screenshot never leaves your machine; only the recognized *text* is sent to Google Translate (MyMemory as fallback).
 - **Gemini API / Claude API**: the screenshot of the frame is sent to Google / Anthropic.
 - **Gemini CLI**: the screenshot is written to a temp dir and handed to the local CLI, which uploads it to Google; the temp dir is deleted afterwards.
-- **🎧 Audio subtitles**: audio chunks (WAV) go to the whisper-server *you* configure — by default a machine on your own LAN, never a cloud service; the resulting *text* then goes to Google Translate.
+- **🎧 Audio subtitles**: audio chunks (WAV) go to the whisper-server *you* configure — by default a machine on your own LAN, never a cloud service. With `translator=local` (the default) the resulting *text* only reaches **your own LAN LLM and never the public internet**; it goes to Google Translate only if the local LLM is unreachable (automatic fallback) or you pick `google` yourself.
 
 No telemetry, no account, no cloud config.
 
 ### Limitations
 
-Windows only. Exclusive-fullscreen games hide every overlay — use borderless or windowed mode. The keyless Google endpoints are unofficial and may rate-limit under heavy use (automatic fallback included). Audio subtitles additionally need a whisper-server on your LAN and an active audio output device on this machine.
+Windows only. Exclusive-fullscreen games hide every overlay — use borderless or windowed mode. The keyless Google endpoints are unofficial and **may rate-limit (HTTP 429) under heavy use** — a real risk for audio subtitles, which fire one request per spoken line; the local LLM backend avoids this entirely, and there is an automatic fallback chain either way. Audio subtitles additionally need a whisper-server on your LAN and an active audio output device on this machine.
 
 ---
 

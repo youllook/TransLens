@@ -68,8 +68,8 @@ class TestJapanesePipeline(unittest.TestCase):
         pcm, rate, ch, width = read_pcm(JA_WAV)
         mono, _ = downmix_resample(pcm, rate, ch, width)
         cfg = {"whisper_server_url": WHISPER_URL, "audio_lang": "ja", "target_lang": "zh-TW"}
-        src, zh, lang, asr_sec, tr_sec = recognize_and_translate(to_wav_bytes(mono), cfg)
-        print(f"\n[ja] asr={asr_sec:.2f}s translate={tr_sec:.2f}s lang={lang}"
+        src, zh, lang, asr_sec, tr_sec, info = recognize_and_translate(to_wav_bytes(mono), cfg)
+        print(f"\n[ja] asr={asr_sec:.2f}s translate={tr_sec:.2f}s lang={lang} via={info.status()}"
               f"\n     原文: {src}\n     譯文: {zh}")
         self.assertIn("探していた場所", src)
         self.assertTrue(zh.strip(), "譯文不應為空")
@@ -78,8 +78,8 @@ class TestJapanesePipeline(unittest.TestCase):
         pcm, rate, ch, width = read_pcm(JA_WAV)
         mono, _ = downmix_resample(pcm, rate, ch, width)
         cfg = {"whisper_server_url": WHISPER_URL, "audio_lang": "auto", "target_lang": "zh-TW"}
-        src, zh, lang, asr_sec, tr_sec = recognize_and_translate(to_wav_bytes(mono), cfg)
-        print(f"\n[ja-auto] asr={asr_sec:.2f}s translate={tr_sec:.2f}s lang={lang}"
+        src, zh, lang, asr_sec, tr_sec, info = recognize_and_translate(to_wav_bytes(mono), cfg)
+        print(f"\n[ja-auto] asr={asr_sec:.2f}s translate={tr_sec:.2f}s lang={lang} via={info.status()}"
               f"\n     原文: {src}\n     譯文: {zh}")
         self.assertIn("探していた場所", src)
         self.assertTrue(zh.strip())
@@ -91,8 +91,8 @@ class TestEnglishPipeline(unittest.TestCase):
         pcm, rate, ch, width = read_pcm(EN_WAV)
         mono, _ = downmix_resample(pcm, rate, ch, width)
         cfg = {"whisper_server_url": WHISPER_URL, "audio_lang": "en", "target_lang": "zh-TW"}
-        src, zh, lang, asr_sec, tr_sec = recognize_and_translate(to_wav_bytes(mono), cfg)
-        print(f"\n[en] asr={asr_sec:.2f}s translate={tr_sec:.2f}s lang={lang}"
+        src, zh, lang, asr_sec, tr_sec, info = recognize_and_translate(to_wav_bytes(mono), cfg)
+        print(f"\n[en] asr={asr_sec:.2f}s translate={tr_sec:.2f}s lang={lang} via={info.status()}"
               f"\n     原文: {src}\n     譯文: {zh}")
         self.assertTrue(src.strip(), "英文原文不應為空")
         self.assertRegex(src.lower(), r"[a-z]{3,}")

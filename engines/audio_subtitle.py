@@ -3,7 +3,7 @@
 流程：
     WASAPI loopback 擷取 → 能量式 VAD 切段 → 打包 16k 單聲道 WAV
     → POST {whisper_server_url}（whisper.cpp server 的 /inference）
-    → 幻聽過濾 → translate_google.translate() → callback 回主執行緒
+    → 幻聽過濾 → translator.translate()（本地 LLM，失敗退 Google）→ callback 回主執行緒
 
 設計原則：
   * 只在真的啟動音訊模式時才 import pyaudiowpatch/numpy，沒裝套件不影響原本 OCR 功能。
@@ -143,23 +143,23 @@ def transcribe(wav_bytes: bytes, url: str, language="auto", timeout=30) -> str:
 
 
 def recognize_and_translate(wav_bytes: bytes, cfg: dict):
-    """單元測試的主要進入點：WAV bytes → (原文, 譯文, 語言, whisper 耗時, 翻譯耗時)。
+    """單元測試的主要進入點：WAV bytes → (原文, 譯文, 語言, whisper 耗時, 翻譯耗時, 翻譯資訊)。
 
     回傳原文為空字串代表這段被判定成空白/幻聽，應該丟掉。
+    翻譯資訊是 engines.translator.TranslateInfo，帶著實際用的後端與是否退版。
     """
     url = cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
     lang = cfg.get("audio_lang", DEFAULTS["audio_lang"])
     t0 = time.time()
     text = transcribe(wav_bytes, url, lang)
     t_asr = time.time() - t0
+    from engines.translator import TranslateInfo, translate
     if is_garbage(text):
-        return "", "", lang, t_asr, 0.0
-    from engines.translate_google import translate
+        return "", "", lang, t_asr, 0.0, TranslateInfo(backend="none")
     t1 = time.time()
-    zh, detected = translate(text, target=cfg.get("target_lang", "zh-TW"),
-                             source=("auto" if lang == "auto" else lang))
+    zh, detected, info = translate(text, cfg, source=("auto" if lang == "auto" else lang))
     t_tr = time.time() - t1
-    return text, zh, (detected or lang), t_asr, t_tr
+    return text, zh, (detected or lang), t_asr, t_tr, info
 
 
 DEFAULTS = {
@@ -408,7 +408,7 @@ class AudioSubtitleWorker:
         """辨識＋翻譯一段音訊。延遲從「切段完成」算起，反映使用者實際等待時間。"""
         t0 = t0 or time.time()
         try:
-            src, zh, lang, asr_sec, _tr_sec = recognize_and_translate(to_wav_bytes(pcm), self.cfg)
+            src, zh, lang, asr_sec, tr_sec, info = recognize_and_translate(to_wav_bytes(pcm), self.cfg)
         except requests.RequestException as e:
             self._emit("error", f"連不上語音辨識伺服器 "
                                 f"{self.cfg.get('whisper_server_url', DEFAULTS['whisper_server_url'])}：{e}")
@@ -423,4 +423,7 @@ class AudioSubtitleWorker:
             return                       # 連續同一句不重複顯示
         self._last_text = src
         self._emit("subtitle", {"src": src, "zh": zh, "lang": lang,
-                                "asr_sec": asr_sec, "total_sec": time.time() - t0})
+                                "asr_sec": asr_sec, "tr_sec": tr_sec,
+                                "translator": info.status(),
+                                "fell_back": info.fell_back,
+                                "total_sec": time.time() - t0})

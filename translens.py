@@ -52,8 +52,17 @@ DEFAULT_CONFIG = {
     "audio_silence_sec": 0.6,
     "audio_max_chunk_sec": 6,
     "subtitle_hold_sec": 8,
+    # 翻譯來源：local = 區網本地 LLM（文字不出門）；google = 免金鑰 Google 端點
+    "translator": "local",
+    "local_llm_url": "http://192.168.0.49:8000/v1",
+    "local_llm_model": "Qwen2.5-7B-Instruct-4bit",
+    "local_llm_api_key": "",
+    "local_llm_timeout_sec": 20,
     "geometry": {"x": 200, "y": 200, "w": 640, "h": 220},
 }
+
+# 翻譯來源下拉：顯示名 -> 設定值
+TRANSLATORS = [("本地 LLM（區網，不出門）", "local"), ("Google（免金鑰）", "google")]
 
 # 音訊字幕語言下拉：顯示名 -> whisper language code
 AUDIO_LANGS = [("自動", "auto"), ("日", "ja"), ("英", "en")]
@@ -389,6 +398,18 @@ class LensApp:
         lang_menu.add_command(label="如何安裝更多 OCR 語言…", command=self._show_ocr_help)
         m.add_cascade(label="OCR 語言（OCR+Google 引擎）", menu=lang_menu)
 
+        # 翻譯來源：本地 LLM（文字留在區網）或 Google（免金鑰但會出外網）
+        tr_menu = tk.Menu(m, tearoff=0, font=(fam, 10))
+        self.translator_var = tk.StringVar(
+            value=self.cfg.get("translator", DEFAULT_CONFIG["translator"]))
+        for label, value in TRANSLATORS:
+            tr_menu.add_radiobutton(label=label, value=value, variable=self.translator_var,
+                                    command=self._on_translator)
+        tr_menu.add_separator()
+        tr_menu.add_command(label=f"本地 LLM：{self.cfg.get('local_llm_url', '')}"
+                                  f" / {self.cfg.get('local_llm_model', '')}", state="disabled")
+        m.add_cascade(label="翻譯來源", menu=tr_menu)
+
         self.show_src_var = tk.BooleanVar(value=self.cfg["show_original"])
         m.add_checkbutton(label="顯示原文", variable=self.show_src_var, command=self._on_show_src)
         m.add_command(label="字級 ＋", command=lambda: self._font_delta(+2))
@@ -432,6 +453,13 @@ class LensApp:
     def _on_ocr_lang(self):
         self.cfg["ocr_lang"] = self.ocr_var.get()
         save_config(self.cfg)
+
+    def _on_translator(self):
+        """切換翻譯來源：存檔即生效（下一句字幕／下一次翻譯就會用新的）。"""
+        self.cfg["translator"] = self.translator_var.get()
+        save_config(self.cfg)
+        if self.audio_var.get():
+            self.panel.show(status=self._audio_status("聆聽中…"), zh="", src="")
 
     def _on_show_src(self):
         self.cfg["show_original"] = self.show_src_var.get()
@@ -493,11 +521,18 @@ class LensApp:
             self.subtitle_job = None
         self.lbl_state.configure(text="自動模式" if self.auto_var.get() else "")
 
-    def _audio_status(self, tail=""):
-        """狀態列：字幕 · whisper@<host> · <lang> · <耗時>"""
+    def _audio_status(self, tail="", translator_note=""):
+        """狀態列：字幕 · whisper@<host> · <lang> · 翻譯: <來源 耗時> · <耗時>"""
         url = self.cfg.get("whisper_server_url", "")
         host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0] or "?"
         parts = ["字幕", f"whisper@{host}", self.cfg.get("audio_lang", "auto")]
+        if translator_note:
+            parts.append(f"翻譯: {translator_note}")
+        else:
+            # 還沒翻過任何一句時，先顯示設定裡選的來源
+            from engines.translator import BACKEND_LABELS
+            choice = self.cfg.get("translator", DEFAULT_CONFIG["translator"])
+            parts.append(f"翻譯: {BACKEND_LABELS.get(choice, choice)}")
         if tail:
             parts.append(tail)
         return " · ".join(parts)
@@ -506,9 +541,11 @@ class LensApp:
         """收到一段字幕：上面顯示譯文、下面顯示原文，subtitle_hold_sec 後清空。"""
         if not self.audio_var.get():
             return                       # 已取消勾選，忽略在路上的殘留字幕
-        self.panel.show(status=self._audio_status(f"{data['total_sec']:.1f}s"),
+        self.panel.show(status=self._audio_status(f"{data['total_sec']:.1f}s",
+                                                  data.get("translator", "")),
                         zh=f"中文: {data['zh']}",
-                        src=(f"原文: {data['src']}" if self.cfg["show_original"] else ""))
+                        src=(f"原文: {data['src']}" if self.cfg["show_original"] else ""),
+                        error=bool(data.get("fell_back")))
         if self.subtitle_job:
             self.root.after_cancel(self.subtitle_job)
         hold_ms = int(float(self.cfg.get("subtitle_hold_sec", 8)) * 1000)
