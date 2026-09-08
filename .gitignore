@@ -9,3 +9,5 @@ venv/
 .vscode/
 Thumbs.db
 desktop.ini
+# VAD 模型：第一次啟用音訊字幕時自動下載（約 2MB），不進版控
+models/*.onnx

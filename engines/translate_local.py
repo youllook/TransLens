@@ -24,16 +24,50 @@ DEFAULTS = {
     "local_llm_timeout_sec": 20,
 }
 
-SYSTEM_PROMPT = (
+# 格式規定與風格規定分開存：prompt_mode=replace 讓使用者整段換掉「風格」，
+# 但「只輸出譯文本身」這段格式規定一定要留著，否則模型會加上解釋或前綴，
+# 字幕面板就會顯示一堆廢話。
+FORMAT_PROMPT = (
     "你是專業的日文／英文影視字幕翻譯，把使用者給的句子翻成台灣繁體中文。\n"
     "嚴格規則：\n"
     "1. 只輸出譯文本身，不要任何解釋、注音、原文、引號或「譯文：」之類的前綴。\n"
-    "2. 全部使用繁體字（正體中文），絕對不可出現簡體字。\n"
-    "3. 用台灣慣用語（品質／影片／網路／資訊／程式），不要中國用語。\n"
-    "4. 保留原句語氣：口語就翻得口語，粗俗就翻得粗俗，正式就翻得正式。\n"
-    "5. 人名、地名採常見的中文譯法。\n"
-    "6. 如果原句沒有可翻譯的內容，就原樣輸出。"
+    "2. 如果原句沒有可翻譯的內容，就原樣輸出。"
 )
+
+# 風格規定：prompt_mode=replace 時整段換成使用者自己寫的。
+STYLE_PROMPT = (
+    "風格規定：\n"
+    "* 全部使用繁體字（正體中文），絕對不可出現簡體字。\n"
+    "* 用台灣慣用語（品質／影片／網路／資訊／程式），不要中國用語。\n"
+    "* 保留原句語氣：口語就翻得口語，粗俗就翻得粗俗，正式就翻得正式。\n"
+    "* 人名、地名採常見的中文譯法。"
+)
+
+SYSTEM_PROMPT = FORMAT_PROMPT + "\n" + STYLE_PROMPT
+
+
+def build_system_prompt(custom="", mode="append", glossary_section=""):
+    """組 system prompt：內建規定 + 使用者的 prompt.txt + 這句用得到的詞彙表。
+
+    mode="append"（預設）把使用者的 prompt 接在內建規定後面；
+    mode="replace" 用它整段取代「風格規定」，但**格式規定一定保留**
+    —— 那段被換掉的話模型會開始加解釋與前綴，字幕就不能看了。
+
+    後面的規定對模型的權重比較高，所以順序是：格式 → 風格 → 詞彙表。
+    7B 這種尺寸的模型對「範例」的服從度高於「規則」，所以 prompt.txt 的
+    範本建議使用者直接寫「原文→想要的譯法」幾行範例。
+    """
+    parts = [FORMAT_PROMPT]
+    custom = (custom or "").strip()
+    if mode == "replace" and custom:
+        parts.append(custom)
+    else:
+        parts.append(STYLE_PROMPT)
+        if custom:
+            parts.append("額外要求（優先於上面的風格規定）：\n" + custom)
+    if glossary_section:
+        parts.append(glossary_section)
+    return "\n".join(p for p in parts if p)
 
 # --- 簡→繁兜底表 ---------------------------------------------------------
 # 只收「模型實測會漏出來、且在繁中語境不具其他意義」的常用簡體字。
@@ -131,11 +165,15 @@ def api_key(cfg: dict = None) -> str:
     return str((cfg or {}).get("local_llm_api_key") or "").strip()
 
 
-def translate(text: str, target="zh-TW", source="auto", timeout=15, cfg=None):
+def translate(text: str, target="zh-TW", source="auto", timeout=15, cfg=None,
+              glossary_section="", custom_prompt=""):
     """回傳 (譯文, 來源語言)。介面與 translate_google.translate 相同。
 
     來源語言這裡不做偵測（本地 LLM 不回報），直接把呼叫端給的 source 傳回去，
     讓上層狀態列仍有東西可顯示。
+
+    glossary_section / custom_prompt 由 translator 那邊組好傳進來
+    （見 build_system_prompt）；都空就等於維持原本的內建 prompt。
     """
     if not text.strip():
         return "", None
@@ -151,10 +189,14 @@ def translate(text: str, target="zh-TW", source="auto", timeout=15, cfg=None):
     if source and source != "auto":
         hint = {"ja": "（原文是日文）", "en": "（原文是英文）"}.get(source, "")
 
+    system = build_system_prompt(
+        custom_prompt, str(cfg.get("prompt_mode", "append") or "append").lower(),
+        glossary_section)
+
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": f"{hint}{text}" if hint else text},
         ],
         "temperature": 0.2,

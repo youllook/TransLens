@@ -1,24 +1,30 @@
 """音訊字幕：把 Windows 系統聲音（WASAPI loopback）送到區網的 whisper-server 辨識，再翻成繁體中文。
 
 流程：
-    WASAPI loopback 擷取 → 能量式 VAD 切段 → 打包 16k 單聲道 WAV
-    → POST {whisper_server_url}（whisper.cpp server 的 /inference）
-    → 幻聽過濾 → translator.translate()（本地 LLM，失敗退 Google）→ callback 回主執行緒
+    WASAPI loopback 擷取 → Silero VAD 切段（退路：能量式）→ 打包 16k 單聲道 WAV
+    → POST {whisper_server_url}（whisper.cpp server 的 /inference，帶標點種子＋詞彙表 prompt）
+    → 幻聽過濾（四條規則，含 90 秒內第二次出現就撤回）
+    → translator.translate()（本地 LLM，失敗退 Google；套詞彙表三層）→ callback 回主執行緒
 
 設計原則：
   * 只在真的啟動音訊模式時才 import pyaudiowpatch/numpy，沒裝套件不影響原本 OCR 功能。
   * 全部在背景執行緒跑，錯誤一律轉成人看得懂的字串，不讓主程式崩潰。
   * callback 只負責把事件塞進 queue，實際的 tk 更新由主執行緒做。
+  * VAD、幻聽過濾、prompt 組裝各自獨立成模組（engines/vad.py、hallucination.py、
+    asr_prompt.py），這裡只負責串起來 —— 那三個都能單獨測，不用開音訊裝置。
 """
 import io
 import logging
 import queue
-import re
 import threading
 import time
 import wave
 
 import requests
+
+from . import asr_prompt, hallucination, vad as vad_mod
+# is_garbage 搬到 hallucination.py 了，這裡再匯出一次讓舊的匯入路徑仍然可用。
+from .hallucination import HALLUCINATION_PATTERNS, is_garbage  # noqa: F401
 
 # audioop 在 Python 3.13 被移除；3.13+ 可安裝 audioop-lts 取得同名模組。
 try:
@@ -33,45 +39,6 @@ TARGET_RATE = 16000          # whisper 要求 16kHz
 TARGET_WIDTH = 2             # int16
 MIN_CHUNK_SEC = 0.5          # 短於這個長度的段落直接丟掉
 FRAMES_PER_BUFFER = 1024
-
-# --- 幻聽 / 垃圾句過濾 -------------------------------------------------------
-# whisper 在靜音或純 BGM 段落常吐出的訓練資料殘留（字幕組署名、片尾致謝等）。
-HALLUCINATION_PATTERNS = [
-    r"ご視聴(?:いただき)?ありがとうございました",
-    r"ご清聴ありがとうございました",
-    r"チャンネル登録",
-    r"高評価",
-    r"^\s*おわり\s*$",
-    r"^\s*終わり\s*$",
-    r"thank(?:s| you) for watching",
-    r"please\s+subscribe",
-    r"^\s*subtitles?\s+by",
-    r"^\s*subs?\s+by",
-    r"amara\.org",
-    r"^\s*字幕(?:製作|翻譯|by)?\s*$",
-    r"^\s*字幕志愿者",
-    r"^\s*\[?\s*(?:music|音楽|音乐|拍手|applause|blank_audio|inaudible)\s*\]?\s*$",
-    r"^\s*（?\s*(?:音楽|拍手|無音)\s*）?\s*$",
-]
-_HALLUCINATION_RE = [re.compile(p, re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
-
-# 只有標點/空白（含全形）就當成沒內容
-_PUNCT_ONLY_RE = re.compile(
-    r"^[\s\W_]*$"
-    , re.UNICODE)
-
-
-def is_garbage(text: str) -> bool:
-    """判斷 whisper 輸出是不是空白、純標點或已知幻聽句。"""
-    t = (text or "").strip()
-    if not t:
-        return True
-    if _PUNCT_ONLY_RE.match(t):
-        return True
-    for rx in _HALLUCINATION_RE:
-        if rx.search(t):
-            return True
-    return False
 
 
 def clean_text(text: str) -> str:
@@ -126,40 +93,101 @@ def rms(pcm: bytes) -> float:
 
 
 # --- whisper-server 客戶端 --------------------------------------------------
-def transcribe(wav_bytes: bytes, url: str, language="auto", timeout=30) -> str:
-    """POST 一段 WAV 給 whisper.cpp server，回傳辨識文字（已壓成單行）。"""
+def transcribe(wav_bytes: bytes, url: str, language="auto", timeout=30, prompt="",
+               verbose=False):
+    """POST 一段 WAV 給 whisper.cpp server。
+
+    verbose=False（預設）回傳辨識文字字串，維持原本的介面。
+    verbose=True 回傳 (文字, 偵測到的語言) —— 語言投票需要知道 whisper
+    判成什麼，那只有 verbose_json 才有 language 欄位。
+    """
+    data = {
+        "language": language,
+        "response_format": "verbose_json" if verbose else "json",
+        "temperature": "0",
+    }
+    if prompt:
+        data["prompt"] = prompt
     r = requests.post(
         url,
         files={"file": ("chunk.wav", wav_bytes, "audio/wav")},
-        data={"language": language, "response_format": "json", "temperature": "0"},
+        data=data,
         timeout=timeout,
     )
     r.raise_for_status()
     try:
-        data = r.json()
+        payload = r.json()
     except ValueError:
-        return clean_text(r.text)
-    return clean_text(data.get("text", "") if isinstance(data, dict) else str(data))
+        text = clean_text(r.text)
+        return (text, "") if verbose else text
+    if not isinstance(payload, dict):
+        text = clean_text(str(payload))
+        return (text, "") if verbose else text
+    text = clean_text(payload.get("text", ""))
+    if not verbose:
+        return text
+    return text, _normalize_lang(payload.get("language", ""))
 
 
-def recognize_and_translate(wav_bytes: bytes, cfg: dict):
-    """單元測試的主要進入點：WAV bytes → (原文, 譯文, 語言, whisper 耗時, 翻譯耗時, 翻譯資訊)。
+def _normalize_lang(lang: str) -> str:
+    """whisper 回的是 'japanese' / 'english' 這種全名，轉成 ja / en。"""
+    l = (lang or "").strip().lower()
+    table = {
+        "japanese": "ja", "ja": "ja", "jpn": "ja",
+        "english": "en", "en": "en", "eng": "en",
+        "chinese": "zh", "zh": "zh", "korean": "ko", "ko": "ko",
+    }
+    return table.get(l, l[:2] if l else "")
+
+
+def recognize_and_translate(wav_bytes: bytes, cfg: dict, prompt=None, language=None,
+                            duration=0.0, hall_filter=None, glossary=None,
+                            custom_prompt=None):
+    """WAV bytes → (原文, 譯文, 語言, whisper 耗時, 翻譯耗時, 翻譯資訊)。
 
     回傳原文為空字串代表這段被判定成空白/幻聽，應該丟掉。
     翻譯資訊是 engines.translator.TranslateInfo，帶著實際用的後端與是否退版。
+
+    prompt=None 時自己組（種子句 + 詞彙表）；worker 會把組好的傳進來重用。
+    hall_filter 給 Filter 實例就用它的四條規則（含跨句的 90 秒重複），
+    沒給就只做「單句就能判」的那三條 —— 單元測試與單次呼叫用得到。
     """
     url = cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
-    lang = cfg.get("audio_lang", DEFAULTS["audio_lang"])
+    lang = language or cfg.get("audio_lang", DEFAULTS["audio_lang"])
+
+    if glossary is None and custom_prompt is None:
+        from . import translator
+        glossary, custom_prompt = translator.load_glossary(cfg)
+    if prompt is None:
+        gloss_prompt = glossary.asr_prompt()[0] if glossary else ""
+        prompt = asr_prompt.build_prompt(gloss_prompt, lang,
+                                         cfg.get("asr_seed_prompt"))
+
     t0 = time.time()
-    text = transcribe(wav_bytes, url, lang)
+    text = transcribe(wav_bytes, url, lang, prompt=prompt)
     t_asr = time.time() - t0
-    from engines.translator import TranslateInfo, translate
-    if is_garbage(text):
+
+    from .translator import TranslateInfo, translate
+    if not duration:
+        duration = _wav_duration(wav_bytes)
+    checker = hall_filter or hallucination.Filter(cfg)
+    if checker.check(text, duration).drop:
         return "", "", lang, t_asr, 0.0, TranslateInfo(backend="none")
+
     t1 = time.time()
-    zh, detected, info = translate(text, cfg, source=("auto" if lang == "auto" else lang))
+    zh, detected, info = translate(text, cfg, source=("auto" if lang == "auto" else lang),
+                                   glossary=glossary, custom_prompt=custom_prompt)
     t_tr = time.time() - t1
     return text, zh, (detected or lang), t_asr, t_tr, info
+
+
+def _wav_duration(wav_bytes: bytes) -> float:
+    """從 WAV 檔頭算秒數（密度規則要用）。壞掉的檔就回 0。"""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            return w.getnframes() / float(w.getframerate() or TARGET_RATE)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 DEFAULTS = {
@@ -232,6 +260,7 @@ class AudioSubtitleWorker:
     callback(kind, payload)：
         kind="status"   payload=str            狀態訊息（開始擷取、裝置名…）
         kind="subtitle" payload=dict           {"src","zh","lang","asr_sec","total_sec"}
+        kind="retract"  payload=dict           {"src"} 這句被判定是幻聽，請把它從面板收回
         kind="error"    payload=str            可讀錯誤訊息（worker 會停止）
     """
 
@@ -243,6 +272,15 @@ class AudioSubtitleWorker:
         self._sender = None
         self._queue = queue.Queue(maxsize=8)
         self._last_text = None
+        self._shown = None          # 最近顯示出去的原文（撤回時要比對）
+        self.filter = hallucination.Filter(cfg)
+        self.lang_lock = asr_prompt.LanguageLock(
+            cfg.get("audio_lang", DEFAULTS["audio_lang"]),
+            samples=int(cfg.get("audio_lang_vote_samples", asr_prompt.VOTE_SAMPLES)))
+        self.glossary = None
+        self.custom_prompt = ""
+        self.vad = None
+        self.vad_note = ""
 
     # --- 生命週期
     def start(self):
@@ -250,6 +288,9 @@ class AudioSubtitleWorker:
             return
         self._stop.clear()
         self._last_text = None
+        self._shown = None
+        self.filter.reset()
+        self.lang_lock.set_configured(self.cfg.get("audio_lang", "auto"))
         while not self._queue.empty():        # 丟掉上一輪殘留
             try:
                 self._queue.get_nowait()
@@ -273,6 +314,10 @@ class AudioSubtitleWorker:
     def running(self):
         return bool(self._thread and self._thread.is_alive())
 
+    def set_language(self, lang):
+        """使用者在下拉手動選了語言：立即生效並停止投票。"""
+        self.lang_lock.set_manual(lang)
+
     def _emit(self, kind, payload):
         try:
             self.callback(kind, payload)
@@ -294,9 +339,10 @@ class AudioSubtitleWorker:
 
         audio = stream = None
         try:
+            self._prepare()
             audio = pa_mod.PyAudio()
             stream, device = open_loopback_stream(pa_mod, audio)
-            self._emit("status", f"擷取中：{device['name']}")
+            self._emit("status", f"擷取中：{device['name']} · {self.vad_note}")
             self._capture_loop(stream, device)
         except AudioSubtitleError as e:
             self._emit("error", str(e))
@@ -316,18 +362,33 @@ class AudioSubtitleWorker:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _prepare(self):
+        """建 VAD、載入詞彙表。VAD 第一次用要下載模型，所以會回報進度。"""
+        from . import translator
+        self.glossary, self.custom_prompt = translator.load_glossary(self.cfg)
+        if self.glossary and self.glossary.warnings:
+            for w in self.glossary.warnings[:3]:
+                self._emit("status", f"詞彙表：{w}")
+
+        max_chunk = float(self.cfg.get("audio_max_chunk_sec",
+                                       DEFAULTS["audio_max_chunk_sec"]))
+        self.vad, self.vad_note = vad_mod.create(
+            self.cfg, max_chunk_sec=max_chunk, progress=self._download_progress)
+
+    def _download_progress(self, done, total, source):
+        """模型下載進度。使用者有權知道程式從哪裡抓了什麼下來。"""
+        if not done:
+            self._emit("status", f"下載 Silero VAD 模型…（來源 {source}）")
+        elif total:
+            self._emit("status", f"下載 Silero VAD 模型… {done * 100 // total}%"
+                                 f"（{total // 1024} KB，來源 {source}）")
+
     def _capture_loop(self, stream, device):
-        cfg = self.cfg
-        silence_sec = float(cfg.get("audio_silence_sec", DEFAULTS["audio_silence_sec"]))
-        max_chunk_sec = float(cfg.get("audio_max_chunk_sec", DEFAULTS["audio_max_chunk_sec"]))
+        """擷取 → VAD → 佇列。VAD 決定切在哪，這裡只管把 PCM 餵進去。"""
         src_rate = int(device["defaultSampleRate"])
         src_channels = int(device["maxInputChannels"]) or 2
-
         rate_state = None
-        speech = bytearray()     # 已重採樣的 16k 單聲道 PCM
-        silence_run = 0.0        # 目前連續靜音秒數
-        noise_floor = 60.0       # 動態噪音底，用來自適應不同音量
-        buf_sec = FRAMES_PER_BUFFER / float(src_rate)
+        self.vad.reset()
 
         last_tick = time.time()
         while not self._stop.is_set():
@@ -341,12 +402,8 @@ class AudioSubtitleWorker:
             if avail < FRAMES_PER_BUFFER:
                 time.sleep(0.05)
                 now = time.time()
-                if speech:
-                    silence_run += now - last_tick
+                self._handle(self.vad.feed_silence(now - last_tick))
                 last_tick = now
-                if speech and silence_run >= silence_sec:
-                    self._flush(speech, silence_sec)
-                    silence_run = 0.0
                 continue
             try:
                 raw = stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
@@ -354,37 +411,23 @@ class AudioSubtitleWorker:
                 self._emit("error", f"音訊擷取中斷：{e}")
                 return
             last_tick = time.time()
-            mono, rate_state = downmix_resample(raw, src_rate, src_channels, TARGET_WIDTH, rate_state)
-            level = rms(mono)
-
-            # 自適應門檻：噪音底慢慢跟隨，門檻取「噪音底 * 3」與絕對下限的較大者
-            threshold = max(noise_floor * 3.0, 120.0)
-            if level < threshold:
-                noise_floor = noise_floor * 0.95 + level * 0.05
-
-            if level >= threshold:
-                speech += mono
-                silence_run = 0.0
-            elif speech:
-                speech += mono          # 保留一點尾音，句尾才不會被切掉
-                silence_run += buf_sec
-
-            cur_sec = len(speech) / float(TARGET_RATE * TARGET_WIDTH)
-            if speech and (silence_run >= silence_sec or cur_sec >= max_chunk_sec):
-                self._flush(speech, silence_sec)
-                silence_run = 0.0
+            mono, rate_state = downmix_resample(raw, src_rate, src_channels,
+                                                TARGET_WIDTH, rate_state)
+            self._handle(self.vad.feed(mono))
 
         # 取消勾選時把手上這句也送出去，不要丟掉
-        if speech:
-            self._flush(speech, silence_sec)
+        self._handle(self.vad.flush())
 
-    def _flush(self, speech: bytearray, silence_sec: float):
-        """把累積的語音切成一段丟進佇列（太短的丟掉），並清空緩衝。"""
-        chunk = bytes(speech)
-        speech.clear()
-        if len(chunk) / float(TARGET_RATE * TARGET_WIDTH) >= MIN_CHUNK_SEC:
+    def _handle(self, events):
+        """把 VAD 的事件轉成佇列裡的工作。"""
+        for ev in events or ():
+            if ev.get("kind") != "speech_end":
+                continue
+            pcm = ev.get("pcm") or b""
+            if len(pcm) / float(TARGET_RATE * TARGET_WIDTH) < MIN_CHUNK_SEC:
+                continue
             try:
-                self._queue.put_nowait((chunk, time.time()))
+                self._queue.put_nowait((pcm, time.time()))
             except queue.Full:
                 # 伺服器塞車時寧可丟最舊的一段，也不要讓擷取停下來
                 logging.warning("音訊字幕佇列已滿，丟棄一段")
@@ -407,23 +450,83 @@ class AudioSubtitleWorker:
     def _process(self, pcm, t0=None):
         """辨識＋翻譯一段音訊。延遲從「切段完成」算起，反映使用者實際等待時間。"""
         t0 = t0 or time.time()
+        duration = len(pcm) / float(TARGET_RATE * TARGET_WIDTH)
+        lang = self.lang_lock.request_lang()
+        voting = self.lang_lock.voting
+        gloss_prompt = self.glossary.asr_prompt()[0] if self.glossary else ""
+        prompt = asr_prompt.build_prompt(gloss_prompt, lang,
+                                         self.cfg.get("asr_seed_prompt"))
+        url = self.cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
+
         try:
-            src, zh, lang, asr_sec, tr_sec, info = recognize_and_translate(to_wav_bytes(pcm), self.cfg)
+            t1 = time.time()
+            # 投票階段要知道 whisper 判成什麼語言，所以用 verbose_json
+            if voting:
+                text, detected = transcribe(to_wav_bytes(pcm), url, lang,
+                                            prompt=prompt, verbose=True)
+            else:
+                text = transcribe(to_wav_bytes(pcm), url, lang, prompt=prompt)
+                detected = lang
+            asr_sec = time.time() - t1
         except requests.RequestException as e:
-            self._emit("error", f"連不上語音辨識伺服器 "
-                                f"{self.cfg.get('whisper_server_url', DEFAULTS['whisper_server_url'])}：{e}")
+            self._emit("error", f"連不上語音辨識伺服器 {url}：{e}")
             return
         except Exception as e:  # noqa: BLE001
-            logging.exception("辨識或翻譯失敗")
+            logging.exception("辨識失敗")
             self._emit("error", f"{type(e).__name__}: {e}")
             return
-        if not src:
-            return                       # 空白或幻聽，安靜丟掉
-        if src == self._last_text:
+
+        if voting:
+            newly = self.lang_lock.observe(detected, text)
+            if newly:
+                self._emit("status", f"{self.lang_lock.status()}"
+                                     f"{'（' + self.lang_lock.detail + '）' if self.lang_lock.detail else ''}")
+
+        verdict = self.filter.check(text, duration)
+        if verdict.drop:
+            # 過濾掉的句子一定要留下痕跡：使用者只會覺得「有幾句沒出來」，
+            # 不查 log 無從知道是被哪條規則擋的。
+            logging.info("幻聽過濾（%s，%.1fs）：%s", verdict.reason, duration, text)
+            if verdict.retract and self._shown and \
+                    hallucination.normalize_repeat(self._shown) == hallucination.normalize_repeat(text):
+                # 第一次出現時還判不出是幻聽，字幕已經顯示出去了；
+                # 第二次出現才確定，所以請 UI 把先前那條收回。
+                self._emit("retract", {"src": self._shown,
+                                       "filtered": self.filter.total})
+                self._shown = None
+            self._emit("status", self._status_tail())
+            return
+        if text == self._last_text:
             return                       # 連續同一句不重複顯示
-        self._last_text = src
-        self._emit("subtitle", {"src": src, "zh": zh, "lang": lang,
+        self._last_text = text
+
+        try:
+            from .translator import translate
+            t2 = time.time()
+            zh, detected_lang, info = translate(
+                text, self.cfg,
+                source=("auto" if lang == "auto" else lang),
+                glossary=self.glossary, custom_prompt=self.custom_prompt)
+            tr_sec = time.time() - t2
+        except Exception as e:  # noqa: BLE001
+            logging.exception("翻譯失敗")
+            self._emit("error", f"{type(e).__name__}: {e}")
+            return
+
+        self._shown = text
+        self._emit("subtitle", {"src": text, "zh": zh,
+                                "lang": detected_lang or lang,
                                 "asr_sec": asr_sec, "tr_sec": tr_sec,
                                 "translator": info.status(),
                                 "fell_back": info.fell_back,
+                                "filtered": self.filter.total,
+                                "lang_status": self.lang_lock.status(),
                                 "total_sec": time.time() - t0})
+
+    def _status_tail(self):
+        """丟掉一句之後更新狀態列（讓「已濾 N 條幻聽」跟著動）。"""
+        parts = [self.lang_lock.status()]
+        summary = self.filter.summary()
+        if summary:
+            parts.append(summary)
+        return " · ".join(parts)

@@ -24,9 +24,11 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageGrab
+
+from engines import glossary as glossary_mod
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -52,6 +54,21 @@ DEFAULT_CONFIG = {
     "audio_silence_sec": 0.6,
     "audio_max_chunk_sec": 6,
     "subtitle_hold_sec": 8,
+    # VAD：auto = 先試 Silero（會分辨人聲與音樂），拿不到就退能量式並在狀態列標明
+    "vad_backend": "auto",
+    "vad_threshold": 0.5,
+    "vad_min_speech_ms": 250,
+    "vad_min_silence_ms": 600,
+    "vad_speech_pad_ms": 200,
+    # 幻聽過濾（見 engines/hallucination.py）。設 false 可整條關掉。
+    "hallucination_repeat": True,
+    "hallucination_repeat_window_sec": 90,
+    "hallucination_repeat_min_dur": 2.5,
+    # 詞彙表與自訂 prompt：留空就只讀程式目錄下的 glossary.txt / prompt.txt
+    "glossary": True,
+    "glossary_file": "",
+    "prompt_file": "",
+    "prompt_mode": "append",
     # 翻譯來源：local = 區網本地 LLM（文字不出門）；google = 免金鑰 Google 端點
     "translator": "local",
     "local_llm_url": "http://192.168.0.49:8000/v1",
@@ -224,6 +241,10 @@ class ResultPanel(tk.Toplevel):
         self.lbl_src.configure(font=(fam, max(8, size - 4)))
         self.follow()
 
+    def showing_source(self, text):
+        """目前面板上顯示的原文是不是這一句（撤回幻聽時要先確認）。"""
+        return bool(text) and text in self.lbl_src.cget("text")
+
     def show(self, status="", zh="", src="", error=False):
         wrap = max(240, self.app.root.winfo_width() - 24)
         self.lbl_status.configure(text=status, fg="#ff7b72" if error else "#8b95a1")
@@ -268,6 +289,8 @@ class LensApp:
         self.auto_job = None
         self.events = queue.Queue()
         self.audio_worker = None      # AudioSubtitleWorker，勾選「🎧字幕」時才建立
+        self.vad_note = ""            # 狀態列顯示的 VAD 名稱（Silero / 能量式）
+        self._filtered = 0            # 這一輪擋掉幾條幻聽
         self.subtitle_job = None      # subtitle_hold_sec 到期後清空面板的 after id
 
         self.root = tk.Tk()
@@ -410,6 +433,32 @@ class LensApp:
                                   f" / {self.cfg.get('local_llm_model', '')}", state="disabled")
         m.add_cascade(label="翻譯來源", menu=tr_menu)
 
+        # 詞彙表與自訂 prompt：全域那份在程式目錄，這裡只管「額外指定一份」
+        g_menu = tk.Menu(m, tearoff=0, font=(fam, 10))
+        g_menu.add_command(label=f"編輯全域詞彙表（{glossary_mod.GLOSSARY_NAME}）…",
+                           command=lambda: self._open_text_file(glossary_mod.GLOSSARY_NAME))
+        g_menu.add_command(label=f"編輯全域 prompt（{glossary_mod.PROMPT_NAME}）…",
+                           command=lambda: self._open_text_file(glossary_mod.PROMPT_NAME))
+        g_menu.add_separator()
+        extra = self.cfg.get("glossary_file") or ""
+        g_menu.add_command(
+            label=f"額外詞彙表：{os.path.basename(extra) if extra else '（未指定）'}…",
+            command=self._pick_glossary)
+        if extra:
+            g_menu.add_command(label="取消額外詞彙表", command=lambda: self._set_glossary(""))
+        extra_p = self.cfg.get("prompt_file") or ""
+        g_menu.add_command(
+            label=f"額外 prompt：{os.path.basename(extra_p) if extra_p else '（未指定）'}…",
+            command=self._pick_prompt)
+        if extra_p:
+            g_menu.add_command(label="取消額外 prompt", command=lambda: self._set_prompt_file(""))
+        g_menu.add_separator()
+        self.glossary_on_var = tk.BooleanVar(value=bool(self.cfg.get("glossary", True)))
+        g_menu.add_checkbutton(label="啟用詞彙表／自訂 prompt", variable=self.glossary_on_var,
+                               command=self._on_glossary_toggle)
+        g_menu.add_command(label=self._glossary_summary(), state="disabled")
+        m.add_cascade(label="詞彙表／自訂 prompt", menu=g_menu)
+
         self.show_src_var = tk.BooleanVar(value=self.cfg["show_original"])
         m.add_checkbutton(label="顯示原文", variable=self.show_src_var, command=self._on_show_src)
         m.add_command(label="字級 ＋", command=lambda: self._font_delta(+2))
@@ -422,6 +471,67 @@ class LensApp:
                             f"{self.cfg['hotkey_toggle']} 隱藏顯示", state="disabled")
         m.add_command(label=f"設定檔：{CONFIG_PATH}", state="disabled")
         m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+
+    # --- 詞彙表／自訂 prompt
+    def _glossary_summary(self):
+        """選單底部那行「目前有幾個詞、幾條規則」。讀不到就說沒有。"""
+        try:
+            g, p = glossary_mod.load_from_cfg(self.cfg)
+        except Exception as e:  # noqa: BLE001
+            return f"（讀取失敗：{e}）"
+        if not g and not p:
+            return "（目前沒有任何詞彙表／自訂 prompt）"
+        return (f"目前：{len(g.terms)} 個對照詞、{len(g.rules)} 條取代規則"
+                f"{'、有自訂 prompt' if p else ''}")
+
+    def _open_text_file(self, name):
+        """用系統預設編輯器打開全域檔；不存在就先建一個帶說明的空檔。"""
+        path = os.path.join(APP_DIR, name)
+        if not os.path.exists(path):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"# TransLens {name}\n# 用記事本編輯即可，存成 UTF-8。\n")
+            except OSError as e:
+                messagebox.showerror("TransLens", f"建立 {name} 失敗：{e}")
+                return
+        try:
+            os.startfile(path)  # noqa: S606 — 開使用者自己的設定檔
+        except OSError as e:
+            messagebox.showerror("TransLens", f"開啟 {name} 失敗：{e}")
+
+    def _pick_glossary(self):
+        path = filedialog.askopenfilename(
+            title="選一份額外的詞彙表", filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")])
+        if path:
+            self._set_glossary(path)
+
+    def _pick_prompt(self):
+        path = filedialog.askopenfilename(
+            title="選一份額外的 prompt", filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")])
+        if path:
+            self._set_prompt_file(path)
+
+    def _set_glossary(self, path):
+        self.cfg["glossary_file"] = path
+        save_config(self.cfg)
+        self._reload_glossary()
+
+    def _set_prompt_file(self, path):
+        self.cfg["prompt_file"] = path
+        save_config(self.cfg)
+        self._reload_glossary()
+
+    def _on_glossary_toggle(self):
+        self.cfg["glossary"] = self.glossary_on_var.get()
+        save_config(self.cfg)
+        self._reload_glossary()
+
+    def _reload_glossary(self):
+        """讓改動立刻生效：字幕模式在跑就叫 worker 重讀一次。"""
+        w = self.audio_worker
+        if w is not None and w.running:
+            from engines import translator
+            w.glossary, w.custom_prompt = translator.load_glossary(self.cfg)
 
     def _install_ocr_langs(self):
         bat = os.path.join(APP_DIR, "install_ocr_lang.bat")
@@ -487,12 +597,14 @@ class LensApp:
 
     # --- 音訊字幕模式
     def _on_audio_lang(self, label):
-        self.cfg["audio_lang"] = self.audio_lang_labels.get(label, "auto")
+        lang = self.audio_lang_labels.get(label, "auto")
+        self.cfg["audio_lang"] = lang
         save_config(self.cfg)
         if self.audio_worker and self.audio_worker.running:
-            # 語言要立刻生效，重開 worker（cfg 是同一個 dict，但重啟比較乾淨）
-            self._stop_audio()
-            self._start_audio()
+            # 手動選語言立即生效並停止投票 —— 不必重開 worker（重開會重新
+            # 下載/載入模型並丟掉手上那段音訊）。
+            self.audio_worker.set_language(lang)
+            self.panel.show(status=self._audio_status("聆聽中…"), zh="", src="")
 
     def _on_audio(self):
         if self.audio_var.get():
@@ -506,6 +618,8 @@ class LensApp:
 
     def _start_audio(self):
         from engines.audio_subtitle import AudioSubtitleWorker
+        self.vad_note = ""
+        self._filtered = 0
         self.audio_worker = AudioSubtitleWorker(
             self.cfg, lambda kind, payload: self.events.put((f"audio_{kind}", payload)))
         self.audio_worker.start()
@@ -521,11 +635,15 @@ class LensApp:
             self.subtitle_job = None
         self.lbl_state.configure(text="自動模式" if self.auto_var.get() else "")
 
-    def _audio_status(self, tail="", translator_note=""):
-        """狀態列：字幕 · whisper@<host> · <lang> · 翻譯: <來源 耗時> · <耗時>"""
+    def _audio_status(self, tail="", translator_note="", lang_status="", filtered=0):
+        """狀態列：字幕 · whisper@<host> · <語言> · VAD · 翻譯: <來源 耗時> · <耗時>"""
         url = self.cfg.get("whisper_server_url", "")
         host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0] or "?"
-        parts = ["字幕", f"whisper@{host}", self.cfg.get("audio_lang", "auto")]
+        # 語言：投票鎖定後 worker 會回報「語言：ja（已鎖定）」，還沒有就顯示設定值
+        parts = ["字幕", f"whisper@{host}",
+                 lang_status or self._lang_status() or self.cfg.get("audio_lang", "auto")]
+        if self.vad_note:
+            parts.append(self.vad_note)
         if translator_note:
             parts.append(f"翻譯: {translator_note}")
         else:
@@ -533,16 +651,28 @@ class LensApp:
             from engines.translator import BACKEND_LABELS
             choice = self.cfg.get("translator", DEFAULT_CONFIG["translator"])
             parts.append(f"翻譯: {BACKEND_LABELS.get(choice, choice)}")
+        filtered = filtered or self._filtered
+        if filtered:
+            parts.append(f"已濾 {filtered} 條幻聽")
         if tail:
             parts.append(tail)
         return " · ".join(parts)
+
+    def _lang_status(self):
+        """worker 目前的語言狀態（沒開 worker 就回空字串）。"""
+        w = self.audio_worker
+        if w is not None and getattr(w, "lang_lock", None) is not None:
+            return w.lang_lock.status()
+        return ""
 
     def _on_subtitle(self, data):
         """收到一段字幕：上面顯示譯文、下面顯示原文，subtitle_hold_sec 後清空。"""
         if not self.audio_var.get():
             return                       # 已取消勾選，忽略在路上的殘留字幕
+        self._filtered = data.get("filtered", self._filtered)
         self.panel.show(status=self._audio_status(f"{data['total_sec']:.1f}s",
-                                                  data.get("translator", "")),
+                                                  data.get("translator", ""),
+                                                  data.get("lang_status", "")),
                         zh=f"中文: {data['zh']}",
                         src=(f"原文: {data['src']}" if self.cfg["show_original"] else ""),
                         error=bool(data.get("fell_back")))
@@ -550,6 +680,31 @@ class LensApp:
             self.root.after_cancel(self.subtitle_job)
         hold_ms = int(float(self.cfg.get("subtitle_hold_sec", 8)) * 1000)
         self.subtitle_job = self.root.after(hold_ms, self._clear_subtitle)
+
+    def _on_retract(self, data):
+        """同一句在 90 秒內第二次出現 = 幻聽：把先前顯示的那條從面板收回。
+
+        只有面板還在顯示那句時才清 —— 使用者可能早就看到別的字幕了，
+        把不相干的內容清掉反而更擾人。
+        """
+        if not self.audio_var.get():
+            return
+        self._filtered = data.get("filtered", self._filtered)
+        if self.panel.showing_source(data.get("src", "")):
+            if self.subtitle_job:
+                self.root.after_cancel(self.subtitle_job)
+                self.subtitle_job = None
+            self.panel.show(status=self._audio_status("聆聽中…"), zh="", src="")
+
+    def _on_audio_status(self, msg):
+        """worker 的狀態訊息。裡面帶 VAD 名稱時記下來，之後每條字幕都顯示。"""
+        if not self.audio_var.get():
+            return
+        text = str(msg or "")
+        if "VAD:" in text:
+            # 「擷取中：<裝置> · VAD: Silero」→ 把 VAD 那段留著給狀態列用
+            self.vad_note = text.split("·")[-1].strip()
+        self.panel.show(status=self._audio_status(text), zh="", src="")
 
     def _clear_subtitle(self):
         self.subtitle_job = None
@@ -600,9 +755,10 @@ class LensApp:
                     self._fail(payload)
                 elif kind == "audio_subtitle":
                     self._on_subtitle(payload)
+                elif kind == "audio_retract":
+                    self._on_retract(payload)
                 elif kind == "audio_status":
-                    if self.audio_var.get():
-                        self.panel.show(status=self._audio_status(payload), zh="", src="")
+                    self._on_audio_status(payload)
                 elif kind == "audio_error":
                     self._audio_failed(payload)
         except queue.Empty:

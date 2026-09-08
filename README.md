@@ -4,7 +4,7 @@
 > **把透鏡框套上去，按一個快捷鍵，當場讀中文。**
 > 一個永遠置頂、可拖曳、可縮放、框內可點穿的透明框，Python + tkinter，預設引擎**零 API 金鑰**。
 
-[English](#english) ｜ [60 秒上手](#60-秒上手) ｜ [為什麼不用其他工具](#為什麼不用其他工具) ｜ [引擎](#引擎) ｜ [操作](#操作) ｜ [音訊字幕](#音訊字幕影片沒字幕時) ｜ [設定](#設定檔) ｜ [隱私](#隱私每個引擎會把什麼送出去)
+[English](#english) ｜ [60 秒上手](#60-秒上手) ｜ [為什麼不用其他工具](#為什麼不用其他工具) ｜ [引擎](#引擎) ｜ [操作](#操作) ｜ [音訊字幕](#音訊字幕影片沒字幕時) ｜ [詞彙表](#替詞表與自訂-prompt詞彙表) ｜ [設定](#設定檔) ｜ [隱私](#隱私每個引擎會把什麼送出去)
 
 ---
 
@@ -122,12 +122,37 @@ OCR 只能翻**畫面上看得到的字**。影片本身沒有字幕、或只有
 
 ```
 Windows 系統聲音（WASAPI loopback）
-  → 能量式 VAD 切句（靜音 0.6 秒或滿 6 秒就切一段）
+  → Silero VAD 切句（神經網路，分辨「人聲」與「音樂／環境音」；靜音 0.6 秒或滿 6 秒就切一段）
   → 16kHz 單聲道 WAV
   → POST 到區網 Mac 上的 whisper-server（whisper.cpp，large-v3-turbo）
-  → 幻聽過濾
+     （帶標點種子句＋詞彙表當 prompt；語言投票鎖定後固定送同一種語言）
+  → 幻聽過濾（四條規則，含「同一句 90 秒內第二次出現就撤回」）
   → 翻譯（預設：區網本地 LLM；連不上才退到 Google）→ 面板顯示「中文 / 原文」
 ```
+
+**Silero VAD：先分辨「這是人在講話嗎」**
+
+擷取到的聲音不會整段送去辨識，而是先過一層 VAD 判斷哪裡有人聲。
+預設用 [Silero VAD](https://github.com/snakers4/silero-vad) v5（onnx，約 2MB），
+它是神經網路模型，**分得出「大聲的音樂」與「人在講話」**——
+這是舊版能量式 VAD（只看音量大小）做不到的事。
+
+實測 60 秒純 BGM 無人聲的影片（Vlog 片頭音樂）：
+
+| | 送進 whisper 的段落 | 幻聽過濾擋掉 | **實際冒出的字幕** |
+|---|---|---|---|
+| 能量式 VAD（只看音量） | 10 段 | 7 條 | **3 條**（「おめでとうございます。」等） |
+| **Silero VAD** | **0 段** | 0 條 | **0 條** |
+
+同一份素材，能量式把整段音樂都當成人聲（99.6% 的窗判定有聲），
+Silero 只有 8.7%，而且那些零星的窗湊不出足夠的「語音含量」，
+所以根本不會送去辨識。**幻聽過濾是補救，VAD 才是根治。**
+清楚的人聲則兩者都判得出來（日文測試音檔：Silero 67.9%、能量式 64.1%）。
+
+模型**第一次勾「🎧字幕」時自動下載**到 `models/silero_vad.onnx`（會顯示來源與進度），
+之後就離線可用。想先抓下來可執行 `install_vad.bat`（也會裝 `onnxruntime`）。
+**沒裝 `onnxruntime` 或下載失敗會自動退回能量式 VAD**，並在狀態列標明
+「VAD: 能量式（Silero 不可用：…）」——功能不會因此壞掉，只是比較容易吐幻聽。
 
 語音辨識**不在這台 Windows 上跑**，而是丟給區網另一台機器的 whisper-server，
 所以這台電腦幾乎不吃 CPU，也不需要裝 CUDA 或大型模型。
@@ -156,8 +181,22 @@ LLM（本專案用 Mac mini 上的 [oMLX](https://github.com/jundot/omlx) 跑 Qw
 | `audio_silence_sec` | `0.6` | 靜音多久算一句結束 |
 | `audio_max_chunk_sec` | `6` | 一段最長幾秒就強制切開 |
 | `subtitle_hold_sec` | `8` | 字幕在面板上停留幾秒後清空 |
+| `vad_backend` | `auto` | `auto` = 先試 Silero，拿不到退能量式；也可寫死 `silero` / `energy` |
+| `vad_threshold` | `0.5` | 語音機率門檻（Silero 官方預設值） |
+| `vad_min_voiced_ms` | `1000` | 一段裡「真的是人聲」的秒數下限，低於就不送去辨識（擋音樂殘留） |
+| `vad_min_silence_ms` | `600` | 靜下來多久算一句講完（沒設就沿用 `audio_silence_sec`） |
+| `vad_speech_pad_ms` | `200` | 每段前後各留多少，句首句尾才不會被切掉 |
+| `hallucination_repeat` | `true` | 是否啟用「同一句短時間內第二次出現就當幻聽」 |
+| `hallucination_repeat_window_sec` | `90` | 幾秒內算「短時間」 |
+| `hallucination_repeat_min_dur` | `2.5` | 兩次都要 ≥ 這麼長才判（短的是人真的在重複講） |
 
-`audio_lang` 指定成 `ja` 或 `en` 會比 `auto` 快一點也穩一點；語言會混的內容才用 `auto`。
+**語言鎖定**：`audio_lang` 指定成 `ja` 或 `en` 會比 `auto` 快一點也穩一點
+（實測英文鎖定後辨識 1.05 秒／段，`auto` 是 2.7 秒／段）。
+留 `auto` 時前 4 段會各自偵測語言、多數決**鎖定**（只在 ja/en 之間選），
+之後所有段都送鎖定的那一種，狀態列顯示「語言：ja（已鎖定）」。
+投票以**轉錄出來的文字**為準而不是 whisper 回報的語言碼——實測混語言的音訊
+whisper 對英文段落仍常回 `ja`，照它的話投票會把整段鎖錯。
+在工具列下拉手動選語言則**立即生效並停止投票**。
 
 **翻譯來源**（OCR 與音訊字幕共用，⚙ → 翻譯來源 可即時切換）
 
@@ -181,12 +220,72 @@ Google「注意你的腳步」）。
 
 - 延遲約 **2～4 秒**：一句話要先講完（靜音 0.6 秒）才會送出，加上辨識約 1～1.5 秒、翻譯約 0.1～2 秒。
   這是「先聽完再翻」的必然代價，不是網路慢。
-- **BGM 或音效大聲時準確度會掉**，whisper 可能吐出幻聽句；常見的垃圾句
-  （「ご視聴ありがとうございました」「Thank you for watching」「[Music]」等）已內建過濾清單，
-  可在 `engines/audio_subtitle.py` 的 `HALLUCINATION_PATTERNS` 自行增補。
+- **BGM 或音效大聲時準確度會掉**，whisper 可能吐出幻聽句。兩道防線：
+  Silero VAD 讓非語音段落根本不會送去辨識（見上表的對照），漏網的再過四條過濾規則
+  （見 `engines/hallucination.py`）：
+  1. **已知垃圾句**——「ご視聴ありがとうございました」「Thank you for watching」「[Music]」等，
+     清單在 `HALLUCINATION_PATTERNS`，可自行增補。
+  2. **密度**——字數／秒數太低（日文 < 0.8 字/秒、英文 < 1.5 字元/秒且該段 ≥ 3 秒），
+     那是模型把一兩個字撐滿整個窗口。
+  3. **段內重複**——同一字或短語連發 ≥ 4 次（「はいはいはいはい」「あああああ」）。
+  4. **90 秒內第二次出現**——正規化後同一句在 90 秒內又出現、而且兩次都 ≥ 2.5 秒，
+     第二條不顯示，並把第一條**從面板上收回**（第一次出現時還判不出是幻聽）。
+     門檻是「兩次都很長」而不是密度：人真的會一直說「はい」，但每次都很短（≈ 1 秒）；
+     幻聽是模型填滿整個窗口，每次都拖很長。狀態列會累計「已濾 N 條幻聽」。
 - 與 OCR 的「自動」模式**互斥**（兩者都會搶結果面板），勾其中一個會自動取消另一個。
   手動按「翻譯」不受影響，隨時可以插一張畫面翻譯。
 - 多人同時說話、口音重、專有名詞多的內容，準確度會明顯下降。
+
+## 替詞表與自訂 prompt（詞彙表）
+
+專有名詞（人名、店名、遊戲術語）最容易被聽錯也最容易被翻錯。TransLens 讀兩個
+純文字檔，用記事本就能改，**OCR 翻譯與音訊字幕都會套用**：
+
+- `glossary.txt` —— 替詞表
+- `prompt.txt` —— 自訂翻譯風格
+
+兩份都**已附帶範本且預設整份都是註解**＝不改變任何行為，要用就把 `#` 拿掉。
+⚙ →「詞彙表／自訂 prompt」可以直接開檔編輯，也能**另外指定一份**
+（例如某個遊戲專用的人名表），兩份會合併、額外那份優先。
+
+**替詞表的兩種寫法**
+
+```
+鹿せんべい = 鹿仙貝        # 對照詞
+平須 => Hirasu            # 取代規則（動譯文）
+[src] 地下せんべい => 鹿せんべい   # 取代規則（動原文，翻譯前就套）
+```
+
+同一份表餵**三個地方**，一層比一層確定：
+
+| 層 | 做什麼 | 保證 |
+|---|---|---|
+| whisper 的 `prompt` | 把「原文詞」餵給語音辨識，讓它比較可能聽對 | 只是提示，可能不聽 |
+| LLM 的 system prompt | 把**這句真的出現過的**對照詞附成詞彙表 | 只是要求，可能不聽 |
+| 輸出取代 | 翻完之後直接對字串做取代 | **一定生效** |
+
+所以聽錯的字一定要有 `=>` 兜底——whisper 的 prompt 只是「提示」不是「指令」。
+詞彙表只附「這句出現過的詞」而不是整張表：一份幾十個詞全附進 prompt，
+每句都要多付那些 token，還會稀釋模型的注意力。
+
+**標點種子句**
+
+whisper 會模仿 prompt 的「書寫風格」。對話式的內容本來就沒什麼完整句子，
+它幾乎不打句號——而沒有標點的原文送進 LLM，譯文也會黏成一長串。
+所以每次都會送一段帶標點的種子句（日文「はい、そうですね。じゃあ、始めましょうか。」、
+英文「Okay, so let's get started. Right?」）誘導它打標點。
+種子句的內容不重要，重要的是**標點的密度與樣式**。
+`asr_seed_prompt` 設成空字串可以關掉，設成別的字串可以自訂。
+
+**自訂 prompt（`prompt.txt`）**
+
+接在內建的翻譯規定後面，用來調整譯文風格（只在翻譯來源＝本地 LLM 時有用，
+Google 端點沒有 prompt 可給）。`prompt_mode` 設 `replace` 可以整段取代內建的
+「風格規定」，但「只輸出譯文本身」那段**格式規定一定保留**——被換掉的話模型會
+開始加解釋與前綴，字幕就不能看了。
+
+> 本地跑的 7B 模型對「範例」的服從度明顯高於「規則」。與其寫「語氣輕鬆一點」，
+> 不如直接給它幾行「原文 → 想要的譯法」，它就會跟著模仿。
 
 ## 設定檔
 
@@ -215,6 +314,13 @@ Google「注意你的腳步」）。
 | `audio_silence_sec` | 靜音多久算一句結束（秒） |
 | `audio_max_chunk_sec` | 單段最長秒數，超過就強制切開 |
 | `subtitle_hold_sec` | 字幕停留幾秒後清空面板 |
+| `vad_backend` | VAD：`auto`（先試 Silero）/ `silero` / `energy`（見「音訊字幕 → Silero VAD」） |
+| `vad_threshold` / `vad_min_voiced_ms` / `vad_min_silence_ms` / `vad_speech_pad_ms` | VAD 細部門檻，一般不用動 |
+| `hallucination_repeat` / `hallucination_repeat_window_sec` / `hallucination_repeat_min_dur` | 幻聽「重複撤回」規則（見「音訊字幕 → 限制」） |
+| `glossary` | 是否啟用替詞表／自訂 prompt（預設 `true`；設 `false` 連全域那份也不讀） |
+| `glossary_file` / `prompt_file` | 額外指定的詞彙表／prompt 路徑（空字串 = 只用程式目錄那份） |
+| `prompt_mode` | `append`（接在內建規定後面）/ `replace`（取代風格規定，格式規定仍保留） |
+| `asr_seed_prompt` | 覆寫送給 whisper 的標點種子句；空字串 = 關掉 |
 | `geometry` | 透鏡的 `x` / `y` / `w` / `h`，關閉時自動更新 |
 
 `GEMINI_API_KEY` 也可以放在 `config.json` 的 `gemini_api_key` 欄位，但建議用環境變數——`config.json` 已在 `.gitignore`，不過金鑰還是別寫進檔案比較安全。
@@ -228,6 +334,8 @@ Google「注意你的腳步」）。
 | **Claude API** | 透鏡框內的**截圖**（PNG）送到 Anthropic API。 |
 | **Gemini CLI** | 截圖存到暫存目錄交給本機 `gemini` CLI，由 CLI 上傳到 Google；完成後暫存目錄即刪除。 |
 | **🎧音訊字幕** | 系統聲音的片段（WAV）送到**你自己指定的** whisper-server（預設是區網內的機器，不經過任何雲端）；辨識出的**文字**在 `translator=local`（預設）時只送到**你自己區網的 LLM**，**完全不出外網**；只有在本地 LLM 連不上而自動退版、或手動選 `google` 時，文字才會送到 Google 翻譯。 |
+
+**Silero VAD 模型**（約 2MB）第一次啟用音訊字幕時會從 GitHub 下載一次到 `models/`，之後完全離線；語音本身**不會**送去任何地方做 VAD 判斷——判斷全在這台電腦上跑。不想讓它連 GitHub 就先跑 `install_vad.bat`，或把 `vad_backend` 設成 `energy`。
 
 除此之外沒有任何遙測、沒有帳號、沒有雲端設定。設定與紀錄都只在同目錄的 `config.json` 和 `translens.log`。
 
@@ -258,16 +366,28 @@ engines/ocr_google.py        預設引擎（OCR+Google）
 engines/gemini_api.py        Gemini API 直連
 engines/gemini_cli.py        Gemini CLI 無頭模式
 engines/claude_api.py        Claude API
-engines/audio_subtitle.py    音訊字幕（WASAPI loopback → whisper-server → 翻譯）
-engines/translator.py        翻譯統一入口（本地 LLM，失敗退 Google）
+engines/audio_subtitle.py    音訊字幕（WASAPI loopback → VAD → whisper-server → 翻譯）
+engines/vad.py               語音偵測：SileroVAD（onnx）與 EnergyVAD（退路），同介面
+engines/hallucination.py     幻聽過濾四條規則（垃圾句／密度／段內重複／90 秒內重複撤回）
+engines/glossary.py          替詞表與自訂 prompt 的解析與三層套用
+engines/asr_prompt.py        whisper 的標點種子句組裝與語言投票鎖定
+engines/translator.py        翻譯統一入口（本地 LLM，失敗退 Google；套詞彙表）
 engines/translate_local.py   區網本地 LLM 翻譯（OpenAI 相容端點）
+glossary.txt / prompt.txt    替詞表與自訂 prompt 範本（預設整份註解＝不改變行為）
+models/silero_vad.onnx       Silero VAD 模型，第一次用到時自動下載（已 gitignore）
 tests/test_audio_subtitle.py 音訊字幕管線測試
+tests/test_vad.py            VAD 測試（含 Silero 與能量式對 BGM 的對照）
+tests/test_hallucination.py  幻聽過濾規則測試（含「不該誤殺」的反例）
+tests/test_glossary.py       詞彙表解析、三層套用、種子 prompt、語言投票
+tests/test_glossary_integration.py  詞彙表在翻譯入口與 OCR 路徑上真的生效
+tests/test_subtitle_worker.py  worker 的撤回、語言投票、prompt 組裝
 tests/test_translator.py     翻譯入口與本地 LLM 測試
 docs/mac/                    Mac 上 whisper-server 與 oMLX 的 launchd 常駐設定
 assets/make_icon.py          用 Pillow 程式化繪製圖示，重跑即可重生 translens.ico / .png
 run.bat                      啟動器（缺套件自動安裝）
 make_shortcut.ps1            建立桌面捷徑
 install_ocr_lang.ps1 / .bat  安裝 Windows OCR 語言包（自動提權）
+install_vad.bat              裝 onnxruntime 並預先下載 Silero VAD 模型（選用）
 config.example.json          設定範本；實際設定 config.json 首次啟動自動產生
 ```
 
@@ -332,12 +452,37 @@ Traditional Chinese translation in the same result panel.
 
 ```
 Windows system audio (WASAPI loopback)
-  → energy VAD, cut on 0.6 s of silence or at 6 s
+  → Silero VAD (neural; tells speech apart from music), cut on 0.6 s of silence or at 6 s
   → 16 kHz mono WAV
   → POST to whisper-server on the LAN (whisper.cpp, large-v3-turbo)
-  → hallucination filter
+     (with a punctuation seed + glossary as the prompt; language locked by vote)
+  → hallucination filter (four rules, incl. "same line twice in 90 s → retract")
   → translation (local LAN LLM by default; falls back to Google) → panel shows translation + original
 ```
+
+**Silero VAD: decide "is a human talking?" first**
+
+Captured audio is not sent to Whisper wholesale — a VAD pass first decides where speech is.
+The default is [Silero VAD](https://github.com/snakers4/silero-vad) v5 (ONNX, ~2 MB), a neural model
+that **tells loud music apart from a person speaking** — something the old energy VAD (which only
+looks at volume) fundamentally cannot do.
+
+Measured on 60 s of pure BGM with no speech (a vlog intro):
+
+| | Segments sent to Whisper | Caught by the filter | **Subtitles actually shown** |
+|---|---|---|---|
+| Energy VAD (volume only) | 10 | 7 | **3** ("おめでとうございます。" etc.) |
+| **Silero VAD** | **0** | 0 | **0** |
+
+On the same clip the energy VAD called 99.6% of windows "speech"; Silero called 8.7%, and those
+stray windows never add up to enough voiced audio to be worth transcribing.
+**Filtering hallucinations is damage control; the VAD is the actual fix.**
+Both handle clear speech fine (Japanese test clip: Silero 67.9%, energy 64.1%).
+
+The model **downloads automatically the first time you tick "🎧字幕"** into `models/silero_vad.onnx`
+(source and progress are shown), and works offline afterwards. Run `install_vad.bat` to fetch it ahead
+of time (it also installs `onnxruntime`). **Without `onnxruntime`, or if the download fails, it falls back
+to the energy VAD** and the status bar says so — nothing breaks, you just get more hallucinations.
 
 Speech recognition does **not** run on this Windows box — it is offloaded to another machine on your LAN,
 so there is no CUDA setup and almost no local CPU cost.
@@ -367,8 +512,22 @@ returns nothing, it falls back to Google automatically and the status bar says s
 | `audio_silence_sec` | `0.6` | Silence that ends a segment |
 | `audio_max_chunk_sec` | `6` | Hard cap on segment length |
 | `subtitle_hold_sec` | `8` | How long a subtitle stays before the panel clears |
+| `vad_backend` | `auto` | `auto` = try Silero, fall back to energy; or force `silero` / `energy` |
+| `vad_threshold` | `0.5` | Speech-probability threshold (Silero's own default) |
+| `vad_min_voiced_ms` | `1000` | Minimum genuinely-voiced audio in a segment before it is transcribed (this is what keeps music out) |
+| `vad_min_silence_ms` | `600` | Silence that ends a segment (falls back to `audio_silence_sec`) |
+| `vad_speech_pad_ms` | `200` | Padding kept on both ends so words are not clipped |
+| `hallucination_repeat` | `true` | Enable "same line twice in a short window = hallucination" |
+| `hallucination_repeat_window_sec` | `90` | How long "a short window" is |
+| `hallucination_repeat_min_dur` | `2.5` | Both occurrences must be at least this long (short repeats are a real person) |
 
-Pinning `audio_lang` to `ja` or `en` is slightly faster and more reliable than `auto`.
+**Language locking.** Pinning `audio_lang` to `ja` or `en` is faster and more reliable than `auto`
+(measured: 1.05 s per segment with English pinned, versus 2.7 s on `auto`). On `auto`, the first four
+segments each detect their own language and a majority vote **locks** it (ja/en only); every later segment
+is sent with the locked language and the status bar reads "語言：ja（已鎖定）". The vote uses the
+**transcribed text**, not Whisper's reported language code — on mixed-language audio Whisper still reports
+`ja` for English segments, and trusting it locks the wrong language. Picking a language from the toolbar
+dropdown **takes effect immediately and stops the vote**.
 
 **Translation backend** (shared by OCR and audio subtitles; switch live under ⚙ → 翻譯來源)
 
@@ -393,12 +552,71 @@ close enough in practice, and the tone and Taiwanese wording are noticeably bett
 
 - Latency is roughly **2–4 s**: a sentence must finish (0.6 s of silence) before it is sent, plus ~1–1.5 s
   of recognition and ~0.1–2 s of translation. That is inherent to transcribe-after-the-fact, not network lag.
-- **Loud BGM or sound effects degrade accuracy** and can make Whisper hallucinate. Common junk lines
-  ("ご視聴ありがとうございました", "Thank you for watching", "[Music]", …) are filtered; extend
-  `HALLUCINATION_PATTERNS` in `engines/audio_subtitle.py` as needed.
+- **Loud BGM or sound effects degrade accuracy** and can make Whisper hallucinate. Two lines of defence:
+  Silero VAD keeps non-speech from being transcribed at all (see the table above), and whatever slips
+  through meets four filter rules (`engines/hallucination.py`):
+  1. **Known junk lines** — "ご視聴ありがとうございました", "Thank you for watching", "[Music]", …
+     the list lives in `HALLUCINATION_PATTERNS` and is yours to extend.
+  2. **Density** — too few characters per second (Japanese < 0.8 ch/s, English < 1.5 ch/s on segments
+     ≥ 3 s): the model stretching one or two words across a whole window.
+  3. **Repeats within a line** — the same character or phrase four or more times in a row
+     ("はいはいはいはい", "あああああ").
+  4. **Same line twice within 90 s** — if a normalized line reappears within the window and *both*
+     occurrences run ≥ 2.5 s, the second is suppressed and the first is **retracted from the panel**
+     (there was no way to tell it was a hallucination the first time). The test is duration, not density:
+     people really do say "はい" over and over, but only ever briefly (~1 s), whereas a hallucinating model
+     fills the entire window every time. The status bar keeps a running "已濾 N 條幻聽" count.
 - Mutually exclusive with OCR auto mode (both compete for the result panel); ticking one unticks the other.
   The manual "翻譯" button still works at any time.
 - Overlapping speakers, heavy accents and dense proper nouns noticeably reduce accuracy.
+
+### Glossary and custom prompt
+
+Proper nouns — names, shops, game terms — are both the easiest thing to mishear and the easiest thing to
+mistranslate. TransLens reads two plain-text files you can edit in Notepad, and **both the OCR path and
+audio subtitles apply them**:
+
+- `glossary.txt` — substitution table
+- `prompt.txt` — translation style
+
+Both ship as templates that are **entirely comments by default**, so they change nothing until you
+uncomment something. ⚙ → "詞彙表／自訂 prompt" opens them for editing and can also point at **an extra
+file** (say, a per-game name list); the two are merged with the extra one winning.
+
+**Two forms**
+
+```
+鹿せんべい = 鹿仙貝        # term pair
+平須 => Hirasu            # replacement (applied to the translation)
+[src] 地下せんべい => 鹿せんべい   # replacement (applied to the source, before translating)
+```
+
+One table feeds **three places**, each more certain than the last:
+
+| Layer | What it does | Guarantee |
+|---|---|---|
+| Whisper `prompt` | Feeds source-language terms to recognition so it is likelier to hear them right | A hint; may be ignored |
+| LLM system prompt | Attaches the term pairs **that actually appear in this line** | A request; may be ignored |
+| Output replacement | Plain string substitution after translating | **Always applies** |
+
+So anything Whisper mishears needs a `=>` rule as a backstop — the Whisper prompt is a *hint*, not an
+instruction. Only terms present in the current line are attached, never the whole table: a few dozen terms
+in every prompt costs those tokens on every line and dilutes the model's attention.
+
+**Punctuation seed.** Whisper imitates the writing style of its prompt. Conversational audio has few
+complete sentences, so it emits almost no full stops — and unpunctuated source text makes the LLM run
+everything together. Every request therefore carries a short punctuated seed
+("はい、そうですね。じゃあ、始めましょうか。" / "Okay, so let's get started. Right?"). The seed's *content*
+is irrelevant; its **punctuation density and style** is the point. Set `asr_seed_prompt` to an empty string
+to disable it, or to your own text to override it.
+
+**Custom prompt (`prompt.txt`)** is appended to the built-in translation rules to adjust style (it only
+applies with the local LLM backend — the keyless Google endpoints take no prompt). `prompt_mode: replace`
+swaps out the built-in *style* rules, but the *format* rule ("output only the translation") is always kept —
+replace it and the model starts adding explanations and prefixes, which ruins subtitles.
+
+> Locally-hosted 7B models follow *examples* far more reliably than *rules*. Rather than "keep the tone
+> casual", give it a few lines of "source → the rendering I want" and it will imitate them.
 
 ### Privacy
 
@@ -406,6 +624,8 @@ close enough in practice, and the tone and Taiwanese wording are noticeably bett
 - **Gemini API / Claude API**: the screenshot of the frame is sent to Google / Anthropic.
 - **Gemini CLI**: the screenshot is written to a temp dir and handed to the local CLI, which uploads it to Google; the temp dir is deleted afterwards.
 - **🎧 Audio subtitles**: audio chunks (WAV) go to the whisper-server *you* configure — by default a machine on your own LAN, never a cloud service. With `translator=local` (the default) the resulting *text* only reaches **your own LAN LLM and never the public internet**; it goes to Google Translate only if the local LLM is unreachable (automatic fallback) or you pick `google` yourself.
+
+The **Silero VAD model** (~2 MB) is downloaded once from GitHub into `models/` the first time you enable audio subtitles, and is fully offline afterwards. Your audio is **never** sent anywhere for VAD — that decision runs entirely on this machine. To avoid the GitHub fetch, run `install_vad.bat` up front or set `vad_backend` to `energy`.
 
 No telemetry, no account, no cloud config.
 
