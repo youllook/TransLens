@@ -3,3 +3,6 @@ requests>=2.31
 winsdk>=1.0
 # 選用：Claude 引擎
 # anthropic>=1.0
+# 選用：音訊字幕模式（擷取系統聲音）。沒裝不影響 OCR 翻譯，勾「🎧字幕」時才會用到。
+# pip install pyaudiowpatch
+# pyaudiowpatch>=0.2.12

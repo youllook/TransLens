@@ -4,7 +4,7 @@
 > **把透鏡框套上去，按一個快捷鍵，當場讀中文。**
 > 一個永遠置頂、可拖曳、可縮放、框內可點穿的透明框，Python + tkinter，預設引擎**零 API 金鑰**。
 
-[English](#english) ｜ [60 秒上手](#60-秒上手) ｜ [為什麼不用其他工具](#為什麼不用其他工具) ｜ [引擎](#引擎) ｜ [操作](#操作) ｜ [設定](#設定檔) ｜ [隱私](#隱私每個引擎會把什麼送出去)
+[English](#english) ｜ [60 秒上手](#60-秒上手) ｜ [為什麼不用其他工具](#為什麼不用其他工具) ｜ [引擎](#引擎) ｜ [操作](#操作) ｜ [音訊字幕](#音訊字幕影片沒字幕時) ｜ [設定](#設定檔) ｜ [隱私](#隱私每個引擎會把什麼送出去)
 
 ---
 
@@ -105,12 +105,64 @@ Google 個人帳號的免費層已不再支援 Gemini CLI 登入；改用 API ke
 | 縮放透鏡 | 拖右下角把手、右邊或下邊框 |
 | 翻譯 | 工具列「翻譯」或全域快捷鍵 `Ctrl+Alt+T`（遊戲中也能按） |
 | 自動模式 | 勾「自動」：每 3 秒檢查一次，框內畫面有變才重翻 |
+| 音訊字幕 | 勾「🎧字幕」：聽系統聲音即時上字幕（見下節），與「自動」互斥 |
 | 隱藏 / 顯示 | `Ctrl+Alt+H` |
 | 切換引擎 | 工具列下拉選單 |
 | 複製譯文 | 結果面板連點兩下，或右鍵選單 |
 | 結果面板 | 預設貼在透鏡下方跟著走；拖開後就獨立，右鍵「貼回透鏡下方」 |
 | 字級、OCR 語言、顯示原文 | 工具列 ⚙ |
 | 關閉 | 工具列 ✕（會記住透鏡位置與大小） |
+
+## 音訊字幕（影片沒字幕時）
+
+OCR 只能翻**畫面上看得到的字**。影片本身沒有字幕、或只有聽得到的旁白時，勾工具列的
+**「🎧字幕」**：TransLens 會聽 Windows 的系統聲音，即時辨識並翻成繁體中文，顯示在同一個結果面板。
+
+**原理**
+
+```
+Windows 系統聲音（WASAPI loopback）
+  → 能量式 VAD 切句（靜音 0.6 秒或滿 6 秒就切一段）
+  → 16kHz 單聲道 WAV
+  → POST 到區網 Mac 上的 whisper-server（whisper.cpp，large-v3-turbo）
+  → 幻聽過濾
+  → Google 翻譯 → 面板顯示「中文 / 原文」
+```
+
+語音辨識**不在這台 Windows 上跑**，而是丟給區網另一台機器的 whisper-server，
+所以這台電腦幾乎不吃 CPU，也不需要裝 CUDA 或大型模型。
+
+**需要準備**
+
+1. 一台跑 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server` 的機器（本專案用區網的 Mac mini M4）。
+   安裝與 launchd 常駐設定見 [`docs/mac/README.md`](docs/mac/README.md)。
+2. 這台 Windows 安裝擷取套件：`pip install pyaudiowpatch`
+   （**沒裝不影響原本的 OCR 翻譯**，只是勾「🎧字幕」時會提示要安裝）。
+3. 這台 Windows 要有**啟用中的音訊輸出裝置**（喇叭或耳機）。loopback 是「錄下正在播放的聲音」，
+   沒有輸出端點就沒有東西可錄。
+
+**設定鍵**
+
+| 鍵 | 預設 | 意義 |
+|---|---|---|
+| `whisper_server_url` | `http://192.168.0.87:8178/inference` | whisper-server 的 inference 端點 |
+| `audio_lang` | `auto` | 辨識語言：`auto` / `ja` / `en`（工具列下拉可即時切換） |
+| `audio_silence_sec` | `0.6` | 靜音多久算一句結束 |
+| `audio_max_chunk_sec` | `6` | 一段最長幾秒就強制切開 |
+| `subtitle_hold_sec` | `8` | 字幕在面板上停留幾秒後清空 |
+
+`audio_lang` 指定成 `ja` 或 `en` 會比 `auto` 快一點也穩一點；語言會混的內容才用 `auto`。
+
+**限制**
+
+- 延遲約 **2～4 秒**：一句話要先講完（靜音 0.6 秒）才會送出，加上辨識約 1～1.5 秒、翻譯約 0.1～2 秒。
+  這是「先聽完再翻」的必然代價，不是網路慢。
+- **BGM 或音效大聲時準確度會掉**，whisper 可能吐出幻聽句；常見的垃圾句
+  （「ご視聴ありがとうございました」「Thank you for watching」「[Music]」等）已內建過濾清單，
+  可在 `engines/audio_subtitle.py` 的 `HALLUCINATION_PATTERNS` 自行增補。
+- 與 OCR 的「自動」模式**互斥**（兩者都會搶結果面板），勾其中一個會自動取消另一個。
+  手動按「翻譯」不受影響，隨時可以插一張畫面翻譯。
+- 多人同時說話、口音重、專有名詞多的內容，準確度會明顯下降。
 
 ## 設定檔
 
@@ -132,6 +184,11 @@ Google 個人帳號的免費層已不再支援 Gemini CLI 登入；改用 API ke
 | `gemini_model` | Gemini API 引擎用的模型名 |
 | `gemini_cli_model` | Gemini CLI 引擎的 `-m` 參數；空字串 = CLI 預設 |
 | `claude_model` | Claude API 引擎用的模型名 |
+| `whisper_server_url` | 音訊字幕的 whisper-server 端點（見「音訊字幕」） |
+| `audio_lang` | 音訊字幕辨識語言：`auto` / `ja` / `en` |
+| `audio_silence_sec` | 靜音多久算一句結束（秒） |
+| `audio_max_chunk_sec` | 單段最長秒數，超過就強制切開 |
+| `subtitle_hold_sec` | 字幕停留幾秒後清空面板 |
 | `geometry` | 透鏡的 `x` / `y` / `w` / `h`，關閉時自動更新 |
 
 `GEMINI_API_KEY` 也可以放在 `config.json` 的 `gemini_api_key` 欄位，但建議用環境變數——`config.json` 已在 `.gitignore`，不過金鑰還是別寫進檔案比較安全。
@@ -144,6 +201,7 @@ Google 個人帳號的免費層已不再支援 Gemini CLI 登入；改用 API ke
 | **Gemini API** | 透鏡框內的**截圖**（PNG）送到 Google Generative Language API。 |
 | **Claude API** | 透鏡框內的**截圖**（PNG）送到 Anthropic API。 |
 | **Gemini CLI** | 截圖存到暫存目錄交給本機 `gemini` CLI，由 CLI 上傳到 Google；完成後暫存目錄即刪除。 |
+| **🎧音訊字幕** | 系統聲音的片段（WAV）送到**你自己指定的** whisper-server（預設是區網內的機器，不經過任何雲端）；辨識出的**文字**再送到 Google 翻譯。 |
 
 除此之外沒有任何遙測、沒有帳號、沒有雲端設定。設定與紀錄都只在同目錄的 `config.json` 和 `translens.log`。
 
@@ -153,6 +211,7 @@ Google 個人帳號的免費層已不再支援 Gemini CLI 登入；改用 API ke
 - 遊戲若為「獨佔全螢幕」，任何覆蓋視窗都不會顯示；請改用「無邊框視窗」或「視窗化」。
 - Google 免金鑰翻譯是非官方端點，短時間大量請求可能被限流（程式會自動退到備援端點）。
 - 結果面板若被拖到透鏡框內，截圖瞬間會先隱藏面板以免翻到自己的譯文。
+- 音訊字幕需要另一台機器跑 whisper-server，且本機要有啟用中的音訊輸出裝置（詳見「音訊字幕」一節）。
 
 ## 除錯
 
@@ -172,6 +231,9 @@ engines/ocr_google.py        預設引擎（OCR+Google）
 engines/gemini_api.py        Gemini API 直連
 engines/gemini_cli.py        Gemini CLI 無頭模式
 engines/claude_api.py        Claude API
+engines/audio_subtitle.py    音訊字幕（WASAPI loopback → whisper-server → 翻譯）
+tests/test_audio_subtitle.py 音訊字幕管線測試
+docs/mac/                    Mac 上 whisper-server 的 launchd 常駐設定
 assets/make_icon.py          用 Pillow 程式化繪製圖示，重跑即可重生 translens.ico / .png
 run.bat                      啟動器（缺套件自動安裝）
 make_shortcut.ps1            建立桌面捷徑
@@ -224,6 +286,7 @@ With several Windows OCR packs installed, `auto` mode runs each and picks the mo
 | Move / resize | Drag the top bar / the bottom-right grip, right or bottom edge |
 | Translate | Toolbar button or global `Ctrl+Alt+T` |
 | Auto mode | Tick "自動": checks the frame every 3 s, re-translates only when the pixels changed |
+| Audio subtitles | Tick "🎧字幕": live subtitles from system audio (see below); mutually exclusive with auto mode |
 | Hide / show | `Ctrl+Alt+H` |
 | Copy translation | Double-click the result panel, or right-click menu |
 | Result panel | Follows the lens by default; drag it away to detach, right-click to re-attach |
@@ -231,17 +294,69 @@ With several Windows OCR packs installed, `auto` mode runs each and picks the mo
 
 Hotkeys and everything else live in `config.json` (created on first run; see `config.example.json` for every key).
 
+### Audio subtitles (when the video has none)
+
+OCR can only translate text you can *see*. When a video has no subtitles at all — just spoken narration —
+tick **"🎧字幕"** in the toolbar: TransLens listens to Windows system audio, transcribes it, and shows a
+Traditional Chinese translation in the same result panel.
+
+```
+Windows system audio (WASAPI loopback)
+  → energy VAD, cut on 0.6 s of silence or at 6 s
+  → 16 kHz mono WAV
+  → POST to whisper-server on the LAN (whisper.cpp, large-v3-turbo)
+  → hallucination filter
+  → Google Translate → panel shows translation + original
+```
+
+Speech recognition does **not** run on this Windows box — it is offloaded to another machine on your LAN,
+so there is no CUDA setup and almost no local CPU cost.
+
+**What you need**
+
+1. A machine running [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server`
+   (this project uses a Mac mini M4 on the LAN). See [`docs/mac/README.md`](docs/mac/README.md)
+   for the launchd service setup.
+2. `pip install pyaudiowpatch` on this Windows machine. **Without it, OCR translation is entirely unaffected** —
+   ticking "🎧字幕" just tells you to install it.
+3. An **active audio output device** (speakers or headphones). Loopback records what is being *played*,
+   so with no render endpoint there is nothing to capture.
+
+**Config keys**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `whisper_server_url` | `http://192.168.0.87:8178/inference` | whisper-server inference endpoint |
+| `audio_lang` | `auto` | Recognition language: `auto` / `ja` / `en` (also a toolbar dropdown) |
+| `audio_silence_sec` | `0.6` | Silence that ends a segment |
+| `audio_max_chunk_sec` | `6` | Hard cap on segment length |
+| `subtitle_hold_sec` | `8` | How long a subtitle stays before the panel clears |
+
+Pinning `audio_lang` to `ja` or `en` is slightly faster and more reliable than `auto`.
+
+**Limitations**
+
+- Latency is roughly **2–4 s**: a sentence must finish (0.6 s of silence) before it is sent, plus ~1–1.5 s
+  of recognition and ~0.1–2 s of translation. That is inherent to transcribe-after-the-fact, not network lag.
+- **Loud BGM or sound effects degrade accuracy** and can make Whisper hallucinate. Common junk lines
+  ("ご視聴ありがとうございました", "Thank you for watching", "[Music]", …) are filtered; extend
+  `HALLUCINATION_PATTERNS` in `engines/audio_subtitle.py` as needed.
+- Mutually exclusive with OCR auto mode (both compete for the result panel); ticking one unticks the other.
+  The manual "翻譯" button still works at any time.
+- Overlapping speakers, heavy accents and dense proper nouns noticeably reduce accuracy.
+
 ### Privacy
 
 - **OCR+Google**: the screenshot never leaves your machine; only the recognized *text* is sent to Google Translate (MyMemory as fallback).
 - **Gemini API / Claude API**: the screenshot of the frame is sent to Google / Anthropic.
 - **Gemini CLI**: the screenshot is written to a temp dir and handed to the local CLI, which uploads it to Google; the temp dir is deleted afterwards.
+- **🎧 Audio subtitles**: audio chunks (WAV) go to the whisper-server *you* configure — by default a machine on your own LAN, never a cloud service; the resulting *text* then goes to Google Translate.
 
 No telemetry, no account, no cloud config.
 
 ### Limitations
 
-Windows only. Exclusive-fullscreen games hide every overlay — use borderless or windowed mode. The keyless Google endpoints are unofficial and may rate-limit under heavy use (automatic fallback included).
+Windows only. Exclusive-fullscreen games hide every overlay — use borderless or windowed mode. The keyless Google endpoints are unofficial and may rate-limit under heavy use (automatic fallback included). Audio subtitles additionally need a whisper-server on your LAN and an active audio output device on this machine.
 
 ---
 

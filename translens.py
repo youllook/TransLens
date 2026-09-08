@@ -9,6 +9,9 @@
   gemini_api  Gemini 視覺模型一步 OCR+翻譯（需 GEMINI_API_KEY）
   gemini_cli  本機 gemini CLI 無頭模式
   claude_api  Claude 視覺模型（需 anthropic 套件 + ANTHROPIC_API_KEY）
+
+另有「🎧字幕」音訊字幕模式：擷取 Windows 系統聲音送到區網 whisper-server 辨識後翻成繁中，
+用於影片本身沒有字幕、OCR 無從辨識的情況（見 README「音訊字幕」）。
 """
 import argparse
 import ctypes
@@ -44,8 +47,16 @@ DEFAULT_CONFIG = {
     "gemini_model": "gemini-2.5-flash",
     "gemini_cli_model": "",
     "claude_model": "claude-opus-5",
+    "whisper_server_url": "http://192.168.0.87:8178/inference",
+    "audio_lang": "auto",
+    "audio_silence_sec": 0.6,
+    "audio_max_chunk_sec": 6,
+    "subtitle_hold_sec": 8,
     "geometry": {"x": 200, "y": 200, "w": 640, "h": 220},
 }
+
+# 音訊字幕語言下拉：顯示名 -> whisper language code
+AUDIO_LANGS = [("自動", "auto"), ("日", "ja"), ("英", "en")]
 
 TRANSPARENT = "#ff00fe"   # 這個顏色的像素會變透明且可點穿
 BORDER = 4                # 邊框粗細
@@ -247,6 +258,8 @@ class LensApp:
         self.last_sig = None
         self.auto_job = None
         self.events = queue.Queue()
+        self.audio_worker = None      # AudioSubtitleWorker，勾選「🎧字幕」時才建立
+        self.subtitle_job = None      # subtitle_hold_sec 到期後清空面板的 after id
 
         self.root = tk.Tk()
         self.root.title("TransLens")
@@ -305,6 +318,26 @@ class LensApp:
                                        bg=c, fg="white", selectcolor="#0a6f66", activebackground=c,
                                        activeforeground="white", font=(fam, 9), cursor="hand2")
         self.chk_auto.pack(side="left", padx=(4, 0))
+
+        # 音訊字幕：擷取系統聲音 → 區網 whisper-server → 翻譯（與 OCR「自動」互斥）
+        self.audio_var = tk.BooleanVar(value=False)
+        self.chk_audio = tk.Checkbutton(self.bar, text="🎧字幕", variable=self.audio_var,
+                                        command=self._on_audio, bg=c, fg="white",
+                                        selectcolor="#0a6f66", activebackground=c,
+                                        activeforeground="white", font=(fam, 9), cursor="hand2")
+        self.chk_audio.pack(side="left", padx=(4, 0))
+
+        self.audio_lang_labels = dict(AUDIO_LANGS)
+        cur_code = self.cfg.get("audio_lang", "auto")
+        cur_label = next((lab for lab, code in AUDIO_LANGS if code == cur_code), "自動")
+        self.audio_lang_var = tk.StringVar(value=cur_label)
+        om_lang = tk.OptionMenu(self.bar, self.audio_lang_var,
+                                *[lab for lab, _ in AUDIO_LANGS], command=self._on_audio_lang)
+        om_lang.configure(bg=c, fg="white", activebackground=c, activeforeground="white",
+                          relief="flat", highlightthickness=0, indicatoron=0,
+                          font=(fam, 9), cursor="hand2")
+        om_lang["menu"].configure(font=(fam, 10))
+        om_lang.pack(side="left", pady=4)
 
         tk.Button(self.bar, text="✕", command=self.quit, bg=c, fg="white", relief="flat",
                   activebackground="#c0392b", font=(fam, 10, "bold"), padx=8, cursor="hand2").pack(side="right", fill="y")
@@ -413,6 +446,9 @@ class LensApp:
 
     def _on_auto(self):
         if self.auto_var.get():
+            if self.audio_var.get():          # 與音訊字幕互斥
+                self.audio_var.set(False)
+                self._stop_audio()
             self.lbl_state.configure(text="自動模式")
             self._auto_tick()
         else:
@@ -420,6 +456,74 @@ class LensApp:
                 self.root.after_cancel(self.auto_job)
                 self.auto_job = None
             self.lbl_state.configure(text="")
+
+    # --- 音訊字幕模式
+    def _on_audio_lang(self, label):
+        self.cfg["audio_lang"] = self.audio_lang_labels.get(label, "auto")
+        save_config(self.cfg)
+        if self.audio_worker and self.audio_worker.running:
+            # 語言要立刻生效，重開 worker（cfg 是同一個 dict，但重啟比較乾淨）
+            self._stop_audio()
+            self._start_audio()
+
+    def _on_audio(self):
+        if self.audio_var.get():
+            # 與 OCR 自動模式互斥：同時開會互搶結果面板
+            if self.auto_var.get():
+                self.auto_var.set(False)
+                self._on_auto()
+            self._start_audio()
+        else:
+            self._stop_audio()
+
+    def _start_audio(self):
+        from engines.audio_subtitle import AudioSubtitleWorker
+        self.audio_worker = AudioSubtitleWorker(
+            self.cfg, lambda kind, payload: self.events.put((f"audio_{kind}", payload)))
+        self.audio_worker.start()
+        self.lbl_state.configure(text="🎧字幕")
+        self.panel.show(status=self._audio_status("啟動中…"), zh="", src="")
+
+    def _stop_audio(self):
+        if self.audio_worker:
+            self.audio_worker.stop()
+            self.audio_worker = None
+        if self.subtitle_job:
+            self.root.after_cancel(self.subtitle_job)
+            self.subtitle_job = None
+        self.lbl_state.configure(text="自動模式" if self.auto_var.get() else "")
+
+    def _audio_status(self, tail=""):
+        """狀態列：字幕 · whisper@<host> · <lang> · <耗時>"""
+        url = self.cfg.get("whisper_server_url", "")
+        host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0] or "?"
+        parts = ["字幕", f"whisper@{host}", self.cfg.get("audio_lang", "auto")]
+        if tail:
+            parts.append(tail)
+        return " · ".join(parts)
+
+    def _on_subtitle(self, data):
+        """收到一段字幕：上面顯示譯文、下面顯示原文，subtitle_hold_sec 後清空。"""
+        if not self.audio_var.get():
+            return                       # 已取消勾選，忽略在路上的殘留字幕
+        self.panel.show(status=self._audio_status(f"{data['total_sec']:.1f}s"),
+                        zh=f"中文: {data['zh']}",
+                        src=(f"原文: {data['src']}" if self.cfg["show_original"] else ""))
+        if self.subtitle_job:
+            self.root.after_cancel(self.subtitle_job)
+        hold_ms = int(float(self.cfg.get("subtitle_hold_sec", 8)) * 1000)
+        self.subtitle_job = self.root.after(hold_ms, self._clear_subtitle)
+
+    def _clear_subtitle(self):
+        self.subtitle_job = None
+        if self.audio_var.get():
+            self.panel.show(status=self._audio_status("聆聽中…"), zh="", src="")
+
+    def _audio_failed(self, msg):
+        """worker 回報錯誤：關掉勾選並把原因顯示在面板上。"""
+        self.audio_var.set(False)
+        self._stop_audio()
+        self.panel.show(status=f"⚠ 音訊字幕：{msg}", zh="", src="", error=True)
 
     # --- 快捷鍵
     def _start_hotkeys(self):
@@ -457,6 +561,13 @@ class LensApp:
                     self._finish(payload)
                 elif kind == "error":
                     self._fail(payload)
+                elif kind == "audio_subtitle":
+                    self._on_subtitle(payload)
+                elif kind == "audio_status":
+                    if self.audio_var.get():
+                        self.panel.show(status=self._audio_status(payload), zh="", src="")
+                elif kind == "audio_error":
+                    self._audio_failed(payload)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_events)
@@ -561,6 +672,10 @@ class LensApp:
 
     # --- 收尾
     def quit(self):
+        try:
+            self._stop_audio()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             r = self.root
             self.cfg["geometry"] = {"x": r.winfo_x(), "y": r.winfo_y(), "w": r.winfo_width(), "h": r.winfo_height()}
