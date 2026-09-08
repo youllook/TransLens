@@ -329,12 +329,31 @@ class AudioSubtitleWorker:
         noise_floor = 60.0       # 動態噪音底，用來自適應不同音量
         buf_sec = FRAMES_PER_BUFFER / float(src_rate)
 
+        last_tick = time.time()
         while not self._stop.is_set():
+            # WASAPI loopback 在「沒有任何程式在播放」時連靜音封包都不會送，read() 會無限卡住
+            # （影片播完、暫停、對話結束後停播都會遇到）。所以只在有資料時才 read；
+            # 沒資料就用牆鐘累積靜音時間，讓最後一句照樣切出去，停止也不會被卡住。
+            try:
+                avail = stream.get_read_available()
+            except OSError:
+                avail = FRAMES_PER_BUFFER
+            if avail < FRAMES_PER_BUFFER:
+                time.sleep(0.05)
+                now = time.time()
+                if speech:
+                    silence_run += now - last_tick
+                last_tick = now
+                if speech and silence_run >= silence_sec:
+                    self._flush(speech, silence_sec)
+                    silence_run = 0.0
+                continue
             try:
                 raw = stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
             except OSError as e:
                 self._emit("error", f"音訊擷取中斷：{e}")
                 return
+            last_tick = time.time()
             mono, rate_state = downmix_resample(raw, src_rate, src_channels, TARGET_WIDTH, rate_state)
             level = rms(mono)
 
@@ -352,15 +371,23 @@ class AudioSubtitleWorker:
 
             cur_sec = len(speech) / float(TARGET_RATE * TARGET_WIDTH)
             if speech and (silence_run >= silence_sec or cur_sec >= max_chunk_sec):
-                chunk = bytes(speech)
-                speech.clear()
+                self._flush(speech, silence_sec)
                 silence_run = 0.0
-                if len(chunk) / float(TARGET_RATE * TARGET_WIDTH) >= MIN_CHUNK_SEC:
-                    try:
-                        self._queue.put_nowait((chunk, time.time()))
-                    except queue.Full:
-                        # 伺服器塞車時寧可丟最舊的一段，也不要讓擷取停下來
-                        logging.warning("音訊字幕佇列已滿，丟棄一段")
+
+        # 取消勾選時把手上這句也送出去，不要丟掉
+        if speech:
+            self._flush(speech, silence_sec)
+
+    def _flush(self, speech: bytearray, silence_sec: float):
+        """把累積的語音切成一段丟進佇列（太短的丟掉），並清空緩衝。"""
+        chunk = bytes(speech)
+        speech.clear()
+        if len(chunk) / float(TARGET_RATE * TARGET_WIDTH) >= MIN_CHUNK_SEC:
+            try:
+                self._queue.put_nowait((chunk, time.time()))
+            except queue.Full:
+                # 伺服器塞車時寧可丟最舊的一段，也不要讓擷取停下來
+                logging.warning("音訊字幕佇列已滿，丟棄一段")
 
     def _send_loop(self):
         """從佇列取出段落做辨識＋翻譯，與擷取執行緒解耦。
