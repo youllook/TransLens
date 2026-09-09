@@ -13,4 +13,4 @@ if not exist "models\silero_vad.onnx" (
     python -c "from engines import vad; vad.ensure_model(progress=lambda d,t,s: None)" 2>nul
     if not exist "models\silero_vad.onnx" echo [TransLens] 警告：VAD 模型下載失敗，字幕模式將退回能量式 VAD。之後可執行 install_vad.bat 重試。
 )
-start "" pythonw translens.py
+start "" pythonw translens.py %*

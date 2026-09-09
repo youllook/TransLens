@@ -278,17 +278,34 @@ class TestSensitivityPresets(unittest.TestCase):
     def test_three_presets(self):
         self.assertEqual(V.sensitivity_params("sensitive"),
                          {"vad_threshold": 0.3, "vad_min_voiced_ms": 400,
-                          "vad_min_speech_ms": 150})
+                          "vad_min_speech_ms": 150, "vad_min_silence_ms": 900})
         self.assertEqual(V.sensitivity_params("normal"),
                          {"vad_threshold": 0.5, "vad_min_voiced_ms": 1000,
-                          "vad_min_speech_ms": 250})
+                          "vad_min_speech_ms": 250, "vad_min_silence_ms": 600})
         self.assertEqual(V.sensitivity_params("strict"),
                          {"vad_threshold": 0.7, "vad_min_voiced_ms": 1500,
-                          "vad_min_speech_ms": 300})
+                          "vad_min_speech_ms": 300, "vad_min_silence_ms": 500})
 
-    def test_unknown_name_falls_back_to_normal(self):
+    def test_sensitive_waits_longer_before_closing_a_sentence(self):
+        """靈敏檔會把水流、風聲當人聲，噪音一閃一閃就會把句子切碎。
+
+        所以它的靜音容忍要比標準檔長，斷掉的碎片才會被接回同一句。
+        """
+        sil = {n: V.sensitivity_params(n)["vad_min_silence_ms"]
+               for n in ("sensitive", "normal", "strict")}
+        self.assertGreater(sil["sensitive"], sil["normal"])
+        self.assertGreater(sil["normal"], sil["strict"])
+
+    def test_switching_sensitivity_updates_silence_live(self):
+        """⚙ 切檔位時靜音容忍要立刻跟著變，不必重開字幕。"""
+        v = V.EnergyVAD({"vad_sensitivity": "strict"})
+        self.assertAlmostEqual(v.seg.min_silence_sec, 0.5, places=3)
+        v.apply_sensitivity({"vad_sensitivity": "sensitive"})
+        self.assertAlmostEqual(v.seg.min_silence_sec, 0.9, places=3)
+
+    def test_unknown_name_falls_back_to_default(self):
         self.assertEqual(V.sensitivity_params("nonsense"),
-                         V.sensitivity_params("normal"))
+                         V.sensitivity_params(V.DEFAULT_SENSITIVITY))
 
     def test_presets_applied_to_vad(self):
         v = V.SileroVAD({"vad_sensitivity": "sensitive"})

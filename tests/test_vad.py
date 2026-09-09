@@ -218,10 +218,18 @@ class TestBgmRejection(unittest.TestCase):
 
     @unittest.skipUnless(has_silero(), "沒有 onnxruntime 或 Silero 模型")
     def test_silero_rejects_bgm(self):
+        """各檔位對純 BGM 的誤判率。
+
+        靈敏檔（門檻 0.3）本來就會多收一些寬頻噪音——水流、風聲、雨聲的頻譜
+        跟氣音很像。這是「寧可多收也不要漏掉小聲說話」的取捨，所以它的上限
+        放寬到 25%；標準與嚴格檔仍必須壓在 10% 以下。
+        """
         pcm = read_pcm16k(BGM_WAV)
-        ratio = voiced_window_ratio(pcm, V.SileroVAD({}))
-        print(f"\n[silero/bgm] 語音窗比例={ratio*100:.1f}%")
-        self.assertLess(ratio, 0.10, "純 BGM 的語音比例應該低於 10%")
+        limits = {"sensitive": 0.25, "normal": 0.10, "strict": 0.10}
+        for name, limit in limits.items():
+            ratio = voiced_window_ratio(pcm, V.SileroVAD({"vad_sensitivity": name}))
+            print(f"\n[silero/bgm] {name}: 語音窗比例={ratio*100:.1f}%")
+            self.assertLess(ratio, limit, f"{name} 檔對純 BGM 的語音比例過高")
 
     def test_energy_is_fooled_by_bgm(self):
         """能量式對同一段 BGM 會判成有聲 —— 證明兩者的差異。"""

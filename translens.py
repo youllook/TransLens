@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "vad_backend": "auto",
     # VAD 靈敏度三檔：sensitive / normal / strict（見 engines/vad.py SENSITIVITY）。
     # 耳語漏掉就調靈敏，BGM 吵、幻聽多就調嚴格。
-    "vad_sensitivity": "normal",
+    "vad_sensitivity": "sensitive",
     # 這三個留 null＝跟著靈敏度走；填了數字就是個別覆寫，靈敏度不會蓋掉。
     "vad_threshold": None,
     "vad_min_speech_ms": None,
@@ -415,7 +415,7 @@ class ResultPanel(tk.Toplevel):
 
 # ----------------------------------------------------------------------------- 透鏡主視窗
 class LensApp:
-    def __init__(self, cfg, smoke=False):
+    def __init__(self, cfg, smoke=False, autostart_subtitle=False):
         self.cfg = cfg
         self.smoke = smoke
         self.busy = False
@@ -446,6 +446,9 @@ class LensApp:
         self.root.bind("<Configure>", lambda e: self.panel.follow())
         if smoke:
             self.root.after(2500, self.quit)
+        if autostart_subtitle:
+            # run-ja.bat / run-en.bat：UI 就緒後自動勾「🎧字幕」，等同使用者手動點一下
+            self.root.after(600, self._autostart_subtitle)
 
     # --- UI 組件
     def _build_frame(self):
@@ -764,6 +767,11 @@ class LensApp:
             # 下載/載入模型並丟掉手上那段音訊）。
             self.audio_worker.set_language(lang)
             self.panel.show(status=self._audio_status("聆聽中…"), zh="", src="")
+
+    def _autostart_subtitle(self):
+        if not self.audio_var.get():
+            self.audio_var.set(True)
+            self._on_audio()
 
     def _on_audio(self):
         if self.audio_var.get():
@@ -1143,6 +1151,10 @@ def main():
     ap.add_argument("--test-image", help="對指定圖片跑翻譯引擎後離開（不開 UI）")
     ap.add_argument("--engine", help="覆寫引擎 key：ocr_google / gemini_api / gemini_cli / claude_api")
     ap.add_argument("--smoke", action="store_true", help="開啟 UI 2.5 秒後自動關閉（自檢）")
+    ap.add_argument("--audio-lang", choices=["auto", "ja", "en"], help="音訊字幕語言（覆寫設定檔）")
+    ap.add_argument("--vad-sensitivity", choices=["sensitive", "normal", "strict"],
+                    help="VAD 靈敏度（覆寫設定檔）")
+    ap.add_argument("--subtitle", action="store_true", help="啟動後直接開啟「🎧字幕」")
     args = ap.parse_args()
 
     logging.basicConfig(filename=LOG_PATH, level=logging.INFO, encoding="utf-8",
@@ -1151,6 +1163,10 @@ def main():
     cfg = load_config()
     if args.engine:
         cfg["engine"] = args.engine
+    if args.audio_lang:
+        cfg["audio_lang"] = args.audio_lang
+    if args.vad_sensitivity:
+        cfg["vad_sensitivity"] = args.vad_sensitivity
     if args.test_image:
         run_test_image(args.test_image, args.engine, cfg)
         return
@@ -1162,7 +1178,7 @@ def main():
         return
     if not os.path.exists(CONFIG_PATH):
         save_config(cfg)
-    LensApp(cfg, smoke=args.smoke).run()
+    LensApp(cfg, smoke=args.smoke, autostart_subtitle=args.subtitle).run()
 
 
 if __name__ == "__main__":
