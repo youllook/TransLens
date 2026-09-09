@@ -61,7 +61,8 @@ DROP_REASONS = {
 # dropped 的 reason -> 狀態列／狀態帶上的中文說明
 DROP_LABELS = {
     "too_short": "太短",
-    "min_speech": "太短",
+    "min_speech": "太短（VAD）",
+    "below_min_chunk": "太短（未達送出長度）",
     "min_voiced": "語音含量不足",
     "empty": "沒辨識到內容",
     "garbage": "幻聽",
@@ -548,8 +549,11 @@ class AudioSubtitleWorker:
             self._speech_started_at = 0.0
             pcm = ev.get("pcm") or b""
             sec = len(pcm) / float(TARGET_RATE * TARGET_WIDTH)
-            if sec < MIN_CHUNK_SEC:
-                self._drop("too_short", sec)
+            floor = getattr(self.vad, "min_chunk_sec", MIN_CHUNK_SEC)
+            if sec < floor:
+                # 與 VAD 的門檻同步（見 vad.SENSITIVITY）。分開標成 below_min_chunk，
+                # 才看得出是「VAD 判太短」還是「送出前的長度下限」擋的。
+                self._drop("below_min_chunk", sec)
                 continue
             self._seq += 1
             seq = self._seq

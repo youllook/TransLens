@@ -117,12 +117,25 @@ class TestDroppedEvents(unittest.TestCase):
     """每一條靜靜丟掉的路徑都要發 dropped —— 一條都不能漏。"""
 
     def test_too_short_segment(self):
+        """短於「送出長度下限」的段落要標成 below_min_chunk。
+
+        以前這裡跟 VAD 的 min_speech 都叫 too_short，使用者看狀態帶
+        分不出是哪一關擋的，也就不知道該調哪個門檻。
+        """
         h = Harness()
-        h.handle([{"kind": "speech_end", "pcm": pcm_of(0.2)}])
+        h.handle([{"kind": "speech_end", "pcm": pcm_of(0.05)}])
         drops = h.of("dropped")
         self.assertEqual(len(drops), 1)
-        self.assertEqual(drops[0]["reason"], "too_short")
+        self.assertEqual(drops[0]["reason"], "below_min_chunk")
         self.assertEqual(h.of("segment_sent"), [], "太短的段落不該送出去")
+
+    def test_short_reply_survives_on_sensitive(self):
+        """0.3 秒的「はい」在靈敏檔要送得出去 —— 日文對話一半是這種應答。"""
+        h = Harness()
+        h.worker.vad = V.EnergyVAD({"vad_sensitivity": "sensitive"})
+        h.handle([{"kind": "speech_end", "pcm": pcm_of(0.3)}])
+        self.assertEqual(h.of("dropped"), [], "靈敏檔不該擋掉 0.3 秒的應答")
+        self.assertEqual(len(h.of("segment_sent")), 1)
 
     def test_min_voiced_from_vad(self):
         """VAD 判「語音含量不足」也要有事件 —— 這是耳語最常消失的那條路。"""
@@ -176,11 +189,13 @@ class TestDroppedEvents(unittest.TestCase):
         summary = h.worker.drop_summary()
         self.assertIn("已丟棄 3", summary)
         self.assertIn("幻聽 2", summary)
-        self.assertIn("太短 1", summary)
+        self.assertIn("太短（未達送出長度） 1", summary)
 
     def test_drop_labels_are_human_readable(self):
         self.assertEqual(A.drop_label("min_voiced"), "語音含量不足")
         self.assertEqual(A.drop_label("too_short"), "太短")
+        self.assertEqual(A.drop_label("min_speech"), "太短（VAD）")
+        self.assertEqual(A.drop_label("below_min_chunk"), "太短（未達送出長度）")
         self.assertEqual(A.drop_label("repeat_window"), "幻聽（重複）")
 
 
@@ -277,14 +292,17 @@ class TestSensitivityPresets(unittest.TestCase):
 
     def test_three_presets(self):
         self.assertEqual(V.sensitivity_params("sensitive"),
-                         {"vad_threshold": 0.3, "vad_min_voiced_ms": 400,
-                          "vad_min_speech_ms": 150, "vad_min_silence_ms": 900})
+                         {"vad_threshold": 0.3, "vad_min_voiced_ms": 120,
+                          "vad_min_speech_ms": 60, "vad_min_silence_ms": 900,
+                          "vad_min_chunk_ms": 250})
         self.assertEqual(V.sensitivity_params("normal"),
                          {"vad_threshold": 0.5, "vad_min_voiced_ms": 1000,
-                          "vad_min_speech_ms": 250, "vad_min_silence_ms": 600})
+                          "vad_min_speech_ms": 250, "vad_min_silence_ms": 600,
+                          "vad_min_chunk_ms": 500})
         self.assertEqual(V.sensitivity_params("strict"),
                          {"vad_threshold": 0.7, "vad_min_voiced_ms": 1500,
-                          "vad_min_speech_ms": 300, "vad_min_silence_ms": 500})
+                          "vad_min_speech_ms": 300, "vad_min_silence_ms": 500,
+                          "vad_min_chunk_ms": 700})
 
     def test_sensitive_waits_longer_before_closing_a_sentence(self):
         """靈敏檔會把水流、風聲當人聲，噪音一閃一閃就會把句子切碎。
@@ -310,8 +328,9 @@ class TestSensitivityPresets(unittest.TestCase):
     def test_presets_applied_to_vad(self):
         v = V.SileroVAD({"vad_sensitivity": "sensitive"})
         self.assertAlmostEqual(v.threshold, 0.3)
-        self.assertAlmostEqual(v.seg.min_voiced_sec, 0.4)
-        self.assertAlmostEqual(v.seg.min_speech_sec, 0.15)
+        self.assertAlmostEqual(v.seg.min_voiced_sec, 0.12)
+        self.assertAlmostEqual(v.seg.min_speech_sec, 0.06)
+        self.assertAlmostEqual(v.min_chunk_sec, 0.25)
 
     def test_explicit_config_still_overrides(self):
         """使用者真的手動調過的值不該被靈敏度蓋掉。"""
@@ -325,15 +344,16 @@ class TestSensitivityPresets(unittest.TestCase):
                "vad_min_speech_ms": 250}
         p = V.resolve_params(cfg)
         self.assertAlmostEqual(p["vad_threshold"], 0.3)
-        self.assertAlmostEqual(p["vad_min_speech_ms"], 150)
+        self.assertAlmostEqual(p["vad_min_speech_ms"], 60)
 
     def test_switch_takes_effect_without_restart(self):
         v = V.SileroVAD({"vad_sensitivity": "normal"})
         self.assertAlmostEqual(v.threshold, 0.5)
         v.apply_sensitivity({"vad_sensitivity": "sensitive"})
         self.assertAlmostEqual(v.threshold, 0.3)
-        self.assertAlmostEqual(v.seg.min_voiced_sec, 0.4)
-        self.assertAlmostEqual(v.seg.min_speech_sec, 0.15)
+        self.assertAlmostEqual(v.seg.min_voiced_sec, 0.12)
+        self.assertAlmostEqual(v.seg.min_speech_sec, 0.06)
+        self.assertAlmostEqual(v.min_chunk_sec, 0.25)
         v.apply_sensitivity({"vad_sensitivity": "strict"})
         self.assertAlmostEqual(v.threshold, 0.7)
         self.assertAlmostEqual(v.seg.min_voiced_sec, 1.5)

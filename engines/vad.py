@@ -54,6 +54,7 @@ DEFAULTS = {
     "vad_threshold": 0.5,          # 語音機率超過就算有聲（silero 官方預設）
     "vad_min_speech_ms": 250,      # 短於這個的「有聲」是雜訊，不成一段
     "vad_min_silence_ms": 600,     # 靜下來這麼久才算一句講完（= audio_silence_sec）
+    "vad_min_chunk_ms": 500,       # 短於這個的段落不送去辨識（見 SENSITIVITY）
     "vad_speech_pad_ms": 200,      # 前後各留一點，句首句尾才不會被切掉
     # 一段裡「真的被判為語音」的總秒數下限。這是擋掉音樂殘留的關鍵門檻：
     # 純 BGM 偶爾會有幾窗衝過 0.5（樂器的某些泛音很像人聲），湊成一段
@@ -71,13 +72,21 @@ DEFAULTS = {
 # min_silence_ms 也跟著檔位走：靈敏檔把水流、風聲這類寬頻噪音也算成人聲
 # （實測純 BGM 誤判率 靈敏 16% / 標準 8.7% / 嚴格 4.3%），噪音一閃一閃就會把
 # 一句話切成好幾段。等久一點再收句，斷掉的碎片會被接回同一句。
+# vad_min_chunk_ms 是「送去辨識的最短段落」。以前寫死在 audio_subtitle 的
+# MIN_CHUNK_SEC=0.5，與這裡的門檻各走各的：VAD 放行 0.3 秒的「はい」，
+# 到了 worker 又被 0.5 秒硬門檻丟掉，狀態帶只寫「太短」看不出是哪一關。
+# 日文對話的應答（はい／うん／ええ／そう）本來就落在 0.3~0.6 秒，
+# 靈敏檔必須讓它們過得去，否則對話類內容會被丟掉一大半。
 SENSITIVITY = {
-    "sensitive": {"vad_threshold": 0.3, "vad_min_voiced_ms": 400,
-                  "vad_min_speech_ms": 150, "vad_min_silence_ms": 900},
+    "sensitive": {"vad_threshold": 0.3, "vad_min_voiced_ms": 120,
+                  "vad_min_speech_ms": 60, "vad_min_silence_ms": 900,
+                  "vad_min_chunk_ms": 250},
     "normal": {"vad_threshold": 0.5, "vad_min_voiced_ms": 1000,
-               "vad_min_speech_ms": 250, "vad_min_silence_ms": 600},
+               "vad_min_speech_ms": 250, "vad_min_silence_ms": 600,
+               "vad_min_chunk_ms": 500},
     "strict": {"vad_threshold": 0.7, "vad_min_voiced_ms": 1500,
-               "vad_min_speech_ms": 300, "vad_min_silence_ms": 500},
+               "vad_min_speech_ms": 300, "vad_min_silence_ms": 500,
+               "vad_min_chunk_ms": 700},
 }
 DEFAULT_SENSITIVITY = "sensitive"
 
@@ -92,7 +101,7 @@ def sensitivity_params(name):
 
 
 PARAM_KEYS = ("vad_threshold", "vad_min_voiced_ms", "vad_min_speech_ms",
-              "vad_min_silence_ms")
+              "vad_min_silence_ms", "vad_min_chunk_ms")
 
 
 def is_preset_value(key, value):
@@ -351,6 +360,11 @@ class _BaseVAD:
             self.seg.min_voiced_sec = max(0.0,
                                           float(params["vad_min_voiced_ms"]) / 1000.0)
         return params
+
+    @property
+    def min_chunk_sec(self) -> float:
+        """送去辨識的最短段落（秒）。跟著靈敏度走，worker 直接用這個值。"""
+        return float(resolve_params(self.cfg)["vad_min_chunk_ms"]) / 1000.0
 
     def reset(self):
         self.seg.reset()
