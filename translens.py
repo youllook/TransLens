@@ -54,6 +54,14 @@ DEFAULT_CONFIG = {
     "audio_silence_sec": 0.6,
     "audio_max_chunk_sec": 6,
     "subtitle_hold_sec": 8,
+    # 字幕模式：stream = LocalAgreement-2 串流（邊聽邊出字，預設）
+    #           segment = 舊的 VAD 切段（等句子講完才送）
+    # 兩者的差別、延遲與適用時機見 README「字幕模式」一節。
+    "subtitle_mode": "stream",
+    # 串流模式：多久送一次辨識、緩衝上限、判定「完全沒人聲」的機率門檻
+    "stream_interval_sec": 1.0,
+    "stream_max_buffer_sec": 25,
+    "stream_silence_prob": 0.2,
     # VAD：auto = 先試 Silero（會分辨人聲與音樂），拿不到就退能量式並在狀態列標明
     "vad_backend": "auto",
     # VAD 靈敏度三檔：sensitive / normal / strict（見 engines/vad.py SENSITIVITY）。
@@ -317,17 +325,28 @@ class ResultPanel(tk.Toplevel):
                                    bg="#14171c", anchor="w", justify="left")
         self.lbl_zh = tk.Label(self.body, text="", font=(fam, app.cfg["font_size"]), fg="#f4f6f8",
                                bg="#14171c", anchor="w", justify="left")
-        self.lbl_src = tk.Label(self.body, text="", font=(fam, max(8, app.cfg["font_size"] - 4)),
+        # 原文行分成兩個 Label：已確定的字（正常灰）與未確定的尾巴（暗灰）。
+        # 串流模式下使用者要看得到「字正在長出來」，同時一眼分得出哪些
+        # 已經定案、哪些還可能會變。用兩個 Label 而不是一個 Text widget，
+        # 是為了維持既有的 pack/wraplength 版面行為（面板高度不跳動）。
+        self.src_row = tk.Frame(self.body, bg="#14171c")
+        self.lbl_src = tk.Label(self.src_row, text="", font=(fam, max(8, app.cfg["font_size"] - 4)),
                                 fg="#9aa3ad", bg="#14171c", anchor="w", justify="left")
+        self.lbl_tent = tk.Label(self.src_row, text="",
+                                 font=(fam, max(8, app.cfg["font_size"] - 4)),
+                                 fg="#5f6672", bg="#14171c", anchor="w", justify="left")
         # 聆聽狀態帶：只有字幕模式開著才 pack（OCR 模式不需要，也不該佔高度）
         self.listen_bar = ListenBar(self.body, fam)
         self.listen_shown = False
 
         self.lbl_status.pack(fill="x")
         self.lbl_zh.pack(fill="x", pady=(2, 0))
-        self.lbl_src.pack(fill="x", pady=(4, 0))
+        self.src_row.pack(fill="x", pady=(4, 0))
+        self.lbl_src.pack(fill="x")
+        self.lbl_tent.pack(fill="x")
 
         for w in (self, self.body, self.lbl_status, self.lbl_zh, self.lbl_src,
+                  self.src_row, self.lbl_tent,
                   self.listen_bar, self.listen_bar.lbl):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
@@ -361,6 +380,7 @@ class ResultPanel(tk.Toplevel):
         fam = self.app.cfg["font_family"]
         self.lbl_zh.configure(font=(fam, size))
         self.lbl_src.configure(font=(fam, max(8, size - 4)))
+        self.lbl_tent.configure(font=(fam, max(8, size - 4)))
         self.follow()
 
     def set_listen_bar(self, visible):
@@ -380,17 +400,32 @@ class ResultPanel(tk.Toplevel):
         """目前面板上顯示的原文是不是這一句（撤回幻聽時要先確認）。"""
         return bool(text) and text in self.lbl_src.cget("text")
 
-    def show(self, status="", zh="", src="", error=False):
+    def show(self, status="", zh="", src="", error=False, tentative=""):
         wrap = max(240, self.app.root.winfo_width() - 24)
         self.lbl_status.configure(text=status, fg="#ff7b72" if error else "#8b95a1")
         self.lbl_zh.configure(text=zh, wraplength=wrap)
         self.lbl_src.configure(text=src, wraplength=wrap)
+        self.lbl_tent.configure(text=tentative, wraplength=wrap)
         if src:
-            self.lbl_src.pack(fill="x", pady=(4, 0))
+            self.lbl_src.pack(fill="x")
         else:
             self.lbl_src.pack_forget()
+        if tentative:
+            self.lbl_tent.pack(fill="x")
+        else:
+            self.lbl_tent.pack_forget()
         self.deiconify()
         self.follow()
+
+    def show_partial(self, status, committed, tentative, zh=""):
+        """串流模式的即時更新：確定的字用正常色，未確定的尾巴用暗灰。
+
+        譯文那一行維持上一句的內容不動 —— 半句話翻出來的中文沒有意義，
+        使用者看原文長出來就知道系統在動了（翻譯要等整句成立才送）。
+        """
+        self.show(status=status, zh=zh,
+                  src=(f"原文: {committed}" if committed else ""),
+                  tentative=tentative)
 
     def follow(self):
         """貼在透鏡正下方；下方放不下就翻到上方。"""
@@ -598,6 +633,21 @@ class LensApp:
                                command=self._on_glossary_toggle)
         g_menu.add_command(label=self._glossary_summary(), state="disabled")
         m.add_cascade(label="詞彙表／自訂 prompt", menu=g_menu)
+
+        # 字幕模式：串流（邊聽邊出字）／分段（等句子講完）
+        from engines import audio_subtitle as audio_mod
+        sm_menu = tk.Menu(m, tearoff=0, font=(fam, 10))
+        self.sub_mode_var = tk.StringVar(value=audio_mod.subtitle_mode(self.cfg))
+        for label, value in audio_mod.SUBTITLE_MODES:
+            sm_menu.add_radiobutton(label=label, value=value,
+                                    variable=self.sub_mode_var,
+                                    command=self._on_subtitle_mode)
+        sm_menu.add_separator()
+        sm_menu.add_command(label="串流：每秒重送緩衝，兩次一致就定案（延遲低、不漏句）",
+                            state="disabled")
+        sm_menu.add_command(label="分段：等靜音才送（省請求，但快轉／暫停容易整句消失）",
+                            state="disabled")
+        m.add_cascade(label="字幕模式（🎧字幕）", menu=sm_menu)
 
         # VAD 靈敏度：耳語漏掉調「靈敏」，BGM 吵幻聽多調「嚴格」
         from engines import vad as vad_mod
@@ -812,10 +862,15 @@ class LensApp:
         url = self.cfg.get("whisper_server_url", "")
         host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0] or "?"
         # 語言：投票鎖定後 worker 會回報「語言：ja（已鎖定）」，還沒有就顯示設定值
-        parts = ["字幕", f"whisper@{host}",
+        from engines import audio_subtitle as audio_mod
+        mode = audio_mod.subtitle_mode(self.cfg)
+        parts = ["字幕", "串流" if mode == audio_mod.STREAM_MODE else "分段",
+                 f"whisper@{host}",
                  lang_status or self._lang_status() or self.cfg.get("audio_lang", "auto")]
+        # 串流模式的 VAD 只是省電開關，不決定句子起訖，標明一下免得
+        # 使用者以為靈敏度還會像分段模式那樣影響「有沒有字幕」。
         if self.vad_note:
-            parts.append(self.vad_note)
+            parts.append(self.vad_note + ("（省電）" if mode == audio_mod.STREAM_MODE else ""))
         if translator_note:
             parts.append(f"翻譯: {translator_note}")
         else:
@@ -850,6 +905,7 @@ class LensApp:
         self._drops = data.get("drops", self._drops)
         self._drop_summary = data.get("drop_summary", self._drop_summary)
         self._listen_state("idle", "聆聽中")
+        # tentative 留空：這一句已經定案了，未確定的尾巴屬於下一句
         self.panel.show(status=self._audio_status(f"{data['total_sec']:.1f}s",
                                                   data.get("translator", ""),
                                                   data.get("lang_status", "")),
@@ -901,6 +957,34 @@ class LensApp:
         w = self.audio_worker
         if w is not None and w.running:
             w.set_sensitivity(value)
+
+    def _on_subtitle_mode(self):
+        """切換字幕模式。worker 在跑就地生效（不重開、不丟音訊）。"""
+        value = self.sub_mode_var.get()
+        self.cfg["subtitle_mode"] = value
+        save_config(self.cfg)
+        w = self.audio_worker
+        if w is not None and w.running:
+            w.set_mode(value)
+
+    def _on_partial(self, data):
+        """串流模式：字正在長出來。確定的正常色 + 未確定的灰色尾巴。
+
+        這是串流模式最主要的畫面回饋 —— 使用者看得到系統在聽、在想，
+        不會再有「講了話但畫面完全沒反應」的疑慮。
+        """
+        if not self.audio_var.get():
+            return
+        committed = data.get("committed", "")
+        tentative = data.get("tentative", "")
+        sec = data.get("sec", 0.0)
+        n = len(committed)
+        self._listen_state("working", f"串流中 · 緩衝 {sec:.1f}s · 已確定 {n} 字")
+        if not self.cfg["show_original"]:
+            return
+        self.panel.show_partial(
+            self._audio_status(f"串流中 · 緩衝 {sec:.1f}s"),
+            committed, tentative, zh=self.panel.lbl_zh.cget("text"))
 
     def _on_listen_bar_toggle(self):
         self.cfg["show_listen_bar"] = self.listen_bar_var.get()
@@ -1015,6 +1099,8 @@ class LensApp:
                     self._on_asr_done(payload)
                 elif kind == "audio_dropped":
                     self._on_dropped(payload)
+                elif kind == "audio_partial":
+                    self._on_partial(payload)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_events)

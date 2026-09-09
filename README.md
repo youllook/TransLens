@@ -118,11 +118,67 @@ Google 個人帳號的免費層已不再支援 Gemini CLI 登入；改用 API ke
 OCR 只能翻**畫面上看得到的字**。影片本身沒有字幕、或只有聽得到的旁白時，勾工具列的
 **「🎧字幕」**：TransLens 會聽 Windows 的系統聲音，即時辨識並翻成繁體中文，顯示在同一個結果面板。
 
+**字幕模式：串流 / 分段**
+
+⚙ →「字幕模式」有兩種，隨時可切、即時生效：
+
+| | **串流**（預設） | **分段** |
+|---|---|---|
+| 何時送辨識 | 每 1 秒把**整個緩衝**重送一次 | 等 VAD 判定「這句講完了」才送 |
+| 句子怎麼定案 | LocalAgreement-2：連續兩次辨識結果的共同前綴就確定 | whisper 對整段的一次結果 |
+| 第一個字出現 | 約 2 秒（辨識一回合） | 靜音 0.6~0.9 秒 + 辨識約 2 秒 |
+| 快轉／暫停／跳播 | **不受影響**，最多少送幾次請求 | VAD 分不出「句尾」還是「被切斷」，**判錯整段消失** |
+| whisper 請求量 | 每分鐘約 30~60 次 | 每句一次（安靜的片子可能整分鐘都沒有） |
+| VAD 的角色 | 只當**省電開關**（整秒沒人聲才跳過），不丟棄任何語音 | 決定句子起訖，也決定要不要丟掉 |
+
+**預設用串流**，因為它解掉了分段模式最痛的問題：看影片時會快轉、跳播、暫停，
+波形突然中斷，VAD 分不出是句尾還是被切斷 —— 一判錯，整句就消失了。
+
+實測 15 秒的標準日文對話（四句，`seg.wav`）：
+
+* **分段模式（標準檔）**：VAD 切出 4 片，全被 `min_speech` / `min_voiced` 丟光，**字幕 0 條**。
+* **串流模式**：四句全部辨識出來，逐句確定延遲見下表。
+
+什麼時候該用分段？whisper-server 很忙、或你在意請求量（串流每分鐘 30~60 次，
+分段可能整分鐘 0 次）的時候。內容是「一句一句、中間有明顯停頓」的演講或旁白，
+分段模式的斷句也會比串流漂亮一點。
+
+**串流模式怎麼運作（LocalAgreement-2）**
+
+出自 [whisper_streaming](https://github.com/ufal/whisper_streaming)（論文 arXiv:2307.14743）的想法，
+TransLens 自己實作在 `engines/streaming.py`（純邏輯、不發 HTTP，所以能單獨測）：
+
+1. 音訊持續累積進一個緩衝，每 1 秒把**整個緩衝**送去辨識一次。
+2. 把這次結果與上一次做**逐字前綴比對**（比對前正規化：去空白、統一全形半形標點、英文轉小寫）。
+3. **連續兩次一致的最長前綴就「確定」**，其餘是「未確定」的尾巴。
+   已確定的字**不會再被改掉** —— 使用者看過的字被抽掉，比留著一個小錯誤更難受。
+4. 確定的文字出現句尾標點（。！？!?）、或緩衝超過 25 秒，就把它切成一條字幕送出去，
+   並把音訊緩衝從「最後一個確定字的時間」往前砍掉（scroll）。
+
+面板上的原文行因此分成兩段顏色：**已確定的字是正常灰**，**未確定的尾巴是暗灰**，
+使用者看得到字正在長出來。翻譯只在**整句確定**時才送（半句翻出來的中文很怪，也省 oMLX 請求）。
+
+**為什麼「一直重送」不會很貴**
+
+因為這台 whisper-server 的辨識耗時**與音訊長度幾乎無關**——
+同一段音訊取前 2 / 5 / 10 / 15 秒送出，耗時都是 1.84~1.93 秒（固定開銷為主）。
+所以反覆重送越來越長的音訊，成本幾乎是常數。這是這個方案可行的前提。
+
+**已知限制：起播的第一句可能不準**
+
+串流看不到未來。實測 `seg.wav` 的第一句「じゃあ次の問題を」起音很輕，
+whisper 要聽到 10 秒的上下文才穩得下來 —— 逐秒送出時它的答案一路在變
+（1~2 秒「はい」、4 秒「じゃあ、次は」、8 秒「今は何だろう?」、10 秒才對）。
+離線一次送完整 15 秒當然拿得到，但即時模式在第 5 秒時手上就只有那 5 秒，
+**沒有任何演算法變得出第 10 秒才出現的資訊**。
+所以起播頭幾秒的第一句可能不準，之後全部正常。
+
 **原理**
 
 ```
 Windows 系統聲音（WASAPI loopback）
-  → Silero VAD 切句（神經網路，分辨「人聲」與「音樂／環境音」；靜音 0.6 秒或滿 6 秒就切一段）
+  → 串流模式：整段累積，每秒重送一次，LocalAgreement-2 定案（VAD 只當省電開關）
+  → 分段模式：Silero VAD 切句（神經網路，分辨「人聲」與「音樂／環境音」；靜音 0.6 秒或滿 6 秒就切一段）
   → 16kHz 單聲道 WAV
   → POST 到區網 Mac 上的 whisper-server（whisper.cpp，large-v3-turbo）
      （帶標點種子句＋詞彙表當 prompt；語言投票鎖定後固定送同一種語言）
@@ -533,9 +589,69 @@ OCR can only translate text you can *see*. When a video has no subtitles at all 
 tick **"🎧字幕"** in the toolbar: TransLens listens to Windows system audio, transcribes it, and shows a
 Traditional Chinese translation in the same result panel.
 
+**Subtitle mode: streaming vs. segmented**
+
+⚙ → "字幕模式" offers two modes; switching takes effect immediately.
+
+| | **Streaming** (default) | **Segmented** |
+|---|---|---|
+| When audio is sent | the **whole buffer**, resent every 1 s | only once VAD decides a sentence ended |
+| How text is finalized | LocalAgreement-2: the common prefix of two consecutive results | one result for the whole segment |
+| First words appear | ~2 s (one ASR round) | 0.6–0.9 s of silence + ~2 s of ASR |
+| Seeking / pausing | **unaffected**; at worst a few requests are skipped | VAD cannot tell "sentence ended" from "cut off" — **a wrong guess loses the whole line** |
+| Whisper requests | ~30–60 per minute | one per sentence (possibly zero for a quiet minute) |
+| Role of VAD | a **power-saving switch** only; never discards speech | decides sentence boundaries *and* what to throw away |
+
+Streaming is the default because it fixes the worst failure of the segmented path: while watching a
+video you seek, skip and pause, the waveform stops abruptly, and VAD cannot tell a sentence ending
+from an interruption — when it guesses wrong, the entire line disappears.
+
+Measured on 15 s of ordinary Japanese dialogue (four lines, `seg.wav`):
+
+* **Segmented (normal sensitivity)**: VAD produced 4 chunks, all discarded by `min_speech` / `min_voiced` — **zero subtitles**.
+* **Streaming**: all four lines recognized.
+
+Use segmented mode when the whisper-server is busy, or when request volume matters (streaming issues
+30–60 per minute; segmented can issue none). For talks or narration with clear pauses between
+sentences, segmented mode also produces slightly cleaner sentence breaks.
+
+**How streaming works (LocalAgreement-2)**
+
+The idea comes from [whisper_streaming](https://github.com/ufal/whisper_streaming) (arXiv:2307.14743);
+TransLens implements it independently in `engines/streaming.py` (pure logic, no HTTP, so it unit-tests standalone):
+
+1. Audio accumulates in a buffer; every 1 s the **entire buffer** is transcribed again.
+2. The new result is compared **character by character** against the previous one, after normalization
+   (whitespace removed, full-width punctuation unified, Latin lowercased).
+3. **The longest prefix that two consecutive results agree on is committed.** The rest stays tentative.
+   Committed text is **never rewritten** — retracting words the user already read is worse than leaving a small error.
+4. When committed text contains sentence-ending punctuation (。！？!?), or the buffer exceeds 25 s, the
+   sentence is emitted as a cue and the audio buffer is scrolled past the last committed word.
+
+The source line in the panel is therefore two-toned: **committed text in normal grey, the tentative tail
+in dim grey**, so you can watch words being finalized. Translation is requested only for **complete
+sentences** (half a sentence translates badly and wastes an oMLX request).
+
+**Why resending constantly is cheap**
+
+Because this whisper-server's latency is **almost independent of audio length** — sending the first
+2 / 5 / 10 / 15 s of the same clip all took 1.84–1.93 s (dominated by fixed overhead). Resending an
+ever-growing buffer therefore costs roughly a constant amount per round. That is the premise the whole
+approach rests on.
+
+**Known limitation: the first line after playback starts may be wrong**
+
+Streaming cannot see the future. In `seg.wav` the first line ("じゃあ次の問題を") starts very softly, and
+Whisper needs about 10 s of context before it settles — sent second by second, its answer keeps changing
+("はい" at 1–2 s, "じゃあ、次は" at 4 s, "今は何だろう?" at 8 s, correct only at 10 s). Sending the full
+15 s offline gets it right, but at second 5 a real-time listener only has 5 seconds; **no algorithm can
+produce information that only appears at second 10.** So the first line after you start playback may be
+off; everything after it is fine.
+
 ```
 Windows system audio (WASAPI loopback)
-  → Silero VAD (neural; tells speech apart from music), cut on 0.6 s of silence or at 6 s
+  → streaming: whole buffer resent every second, finalized by LocalAgreement-2 (VAD is only a power switch)
+  → segmented: Silero VAD (neural; tells speech apart from music), cut on 0.6 s of silence or at 6 s
   → 16 kHz mono WAV
   → POST to whisper-server on the LAN (whisper.cpp, large-v3-turbo)
      (with a punctuation seed + glossary as the prompt; language locked by vote)

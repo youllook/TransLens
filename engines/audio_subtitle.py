@@ -22,7 +22,7 @@ import wave
 
 import requests
 
-from . import asr_prompt, hallucination, vad as vad_mod
+from . import asr_prompt, hallucination, streaming, vad as vad_mod
 # is_garbage 搬到 hallucination.py 了，這裡再匯出一次讓舊的匯入路徑仍然可用。
 from .hallucination import HALLUCINATION_PATTERNS, is_garbage  # noqa: F401
 
@@ -174,6 +174,38 @@ def transcribe(wav_bytes: bytes, url: str, language="auto", timeout=30, prompt="
     return text, _normalize_lang(payload.get("language", ""))
 
 
+def transcribe_words(wav_bytes: bytes, url: str, language="auto", timeout=60,
+                     prompt=""):
+    """POST 一段 WAV，回傳 (words 陣列, 全文, 偵測到的語言)。
+
+    串流模式要逐字時間戳才能做前綴比對與時間軸對齊，所以固定用
+    verbose_json 並把每個 segment 的 words 串成一條序列。
+
+    注意：words 裡的 CJK 字元可能是壞的（whisper.cpp 會把一個字切成
+    兩半，各自變成 U+FFFD），所以**全文也要一起回傳** ——
+    engines/streaming.py 以全文為字元來源，words 只拿來對時間軸。
+    """
+    data = {"language": language, "response_format": "verbose_json",
+            "temperature": "0"}
+    if prompt:
+        data["prompt"] = prompt
+    r = requests.post(url, files={"file": ("chunk.wav", wav_bytes, "audio/wav")},
+                      data=data, timeout=timeout)
+    r.raise_for_status()
+    try:
+        payload = r.json()
+    except ValueError:
+        return [], clean_text(r.text), ""
+    if not isinstance(payload, dict):
+        return [], clean_text(str(payload)), ""
+    words = []
+    for seg in payload.get("segments") or ():
+        if isinstance(seg, dict):
+            words.extend(seg.get("words") or ())
+    return (words, clean_text(payload.get("text", "")),
+            _normalize_lang(payload.get("language", "")))
+
+
 def _normalize_lang(lang: str) -> str:
     """whisper 回的是 'japanese' / 'english' 這種全名，轉成 ja / en。"""
     l = (lang or "").strip().lower()
@@ -241,7 +273,30 @@ DEFAULTS = {
     "audio_silence_sec": 0.6,
     "audio_max_chunk_sec": 6,
     "subtitle_hold_sec": 8,
+    # 字幕模式：stream = LocalAgreement-2 串流（預設），segment = 舊的 VAD 切段
+    "subtitle_mode": "stream",
+    "stream_interval_sec": streaming.DEFAULTS["stream_interval_sec"],
+    "stream_max_buffer_sec": streaming.DEFAULTS["stream_max_buffer_sec"],
+    "stream_silence_prob": streaming.DEFAULTS["stream_silence_prob"],
 }
+
+# 字幕模式：⚙ 選單的顯示名 -> 設定值
+SUBTITLE_MODES = [("串流（邊聽邊出字）", "stream"), ("分段（等句子講完）", "segment")]
+STREAM_MODE = "stream"
+SEGMENT_MODE = "segment"
+
+
+def subtitle_mode(cfg):
+    """設定 -> 'stream' 或 'segment'。不認得的值一律當 stream。"""
+    mode = str((cfg or {}).get("subtitle_mode", DEFAULTS["subtitle_mode"]) or "").strip().lower()
+    return SEGMENT_MODE if mode == SEGMENT_MODE else STREAM_MODE
+
+
+def subtitle_mode_label(mode):
+    for label, value in SUBTITLE_MODES:
+        if value == mode:
+            return label
+    return str(mode or STREAM_MODE)
 
 
 class AudioSubtitleError(RuntimeError):
@@ -348,6 +403,13 @@ class AudioSubtitleWorker:
         self._last_progress_sec = 0.0  # speech_progress 每 0.5s 才發一次
         self._speech_started_at = 0.0
         self.drops = {}               # reason -> 次數（狀態列的「已丟棄 N」）
+        # --- 串流模式（subtitle_mode="stream"）
+        self.mode = subtitle_mode(cfg)
+        self.session = streaming.StreamingSession(cfg)
+        self._stream_prompt = ""      # 這一輪要送的 prompt（每次語言變了才重組）
+        self._stream_lang = None
+        self._silence_run = 0.0       # 連續判定為靜音的秒數（省電開關用）
+        self._asr_busy = threading.Event()   # 串流模式：辨識執行緒忙不忙
 
     # --- 生命週期
     def start(self):
@@ -359,6 +421,12 @@ class AudioSubtitleWorker:
         self._seq = 0
         self._speech_started_at = 0.0
         self.drops = {}
+        self.mode = subtitle_mode(self.cfg)
+        self.session = streaming.StreamingSession(self.cfg)
+        self._stream_prompt = ""
+        self._stream_lang = None
+        self._silence_run = 0.0
+        self._asr_busy.clear()
         self.filter.reset()
         self.lang_lock.set_configured(self.cfg.get("audio_lang", "auto"))
         while not self._queue.empty():        # 丟掉上一輪殘留
@@ -387,6 +455,31 @@ class AudioSubtitleWorker:
     def set_language(self, lang):
         """使用者在下拉手動選了語言：立即生效並停止投票。"""
         self.lang_lock.set_manual(lang)
+
+    def set_mode(self, mode=None):
+        """使用者在 ⚙ 換了字幕模式：即時生效，不重開 worker。
+
+        切換時要把手上的東西收乾淨，否則會兩套狀態機同時有半句話：
+        離開串流模式就把 session 裡的字送出去，離開分段模式就把 VAD
+        手上那段送出去 —— 兩邊都不丟掉使用者已經講過的話。
+        """
+        if mode is not None:
+            self.cfg["subtitle_mode"] = mode
+        new_mode = subtitle_mode(self.cfg)
+        if new_mode == self.mode:
+            return new_mode
+        if self.mode == STREAM_MODE:
+            self._stream_finish()
+        elif self.vad is not None:
+            self._handle(self.vad.flush())
+        self.mode = new_mode
+        self.session = streaming.StreamingSession(self.cfg)
+        self._stream_prompt = ""
+        self._stream_lang = None
+        self._silence_run = 0.0
+        self._asr_busy.clear()
+        self._emit("status", f"字幕模式：{subtitle_mode_label(new_mode)}")
+        return new_mode
 
     def set_sensitivity(self, sensitivity=None):
         """使用者在 ⚙ 換了 VAD 靈敏度：正在跑的 VAD 就地換門檻，不重開 worker。
@@ -489,7 +582,13 @@ class AudioSubtitleWorker:
             if avail < FRAMES_PER_BUFFER:
                 time.sleep(0.05)
                 now = time.time()
-                self._handle(self.vad.feed_silence(now - last_tick))
+                if self.mode != STREAM_MODE:
+                    self._handle(self.vad.feed_silence(now - last_tick))
+                else:
+                    # 沒有音訊封包＝播放暫停／停播。串流模式不靠靜音判句尾，
+                    # 但手上如果已經有夠久沒動的緩衝，該把它結掉送出去，
+                    # 不然使用者暫停後最後一句會一直吊著不出現。
+                    self._stream_idle(now - last_tick)
                 last_tick = now
                 # 量表本身是「讀走式」的（take_level），停播後自然會歸零，
                 # 這裡只要照常取樣就好。真的靜下來超過 LEVEL_DECAY_SEC 才
@@ -506,12 +605,29 @@ class AudioSubtitleWorker:
             last_tick = last_audio_at = time.time()
             mono, rate_state = downmix_resample(raw, src_rate, src_channels,
                                                 TARGET_WIDTH, rate_state)
-            self._handle(self.vad.feed(mono))
+            if self.mode == STREAM_MODE:
+                # 串流模式：VAD 只用來量表與「這段有沒有人聲」，不切段。
+                # feed() 的事件一律忽略 —— 那些是切段用的，串流不需要，
+                # 而且**不能**讓它決定丟棄任何音訊（那正是舊做法的病）。
+                self.vad.feed(mono)
+                # 真的讀到音訊了 → 這不是暫停，把「沒有封包」的計時歸零。
+                # 少了這一行，realtime 的 loopback 每兩塊之間都會短暫地
+                # 讀不到資料，_stream_idle 就會誤判成暫停、每 1.5 秒把緩衝
+                # 清掉一次 —— LocalAgreement 永遠湊不到「連兩次一致」，
+                # 每一句都只能靠 flush() 硬吐出來（實測 15 秒只送 4 輪辨識，
+                # 而且 committed 永遠是空的）。
+                self._silence_run = 0.0
+                self._stream_feed(mono)
+            else:
+                self._handle(self.vad.feed(mono))
             self._tick_level()
             self._tick_progress()
 
         # 取消勾選時把手上這句也送出去，不要丟掉
-        self._handle(self.vad.flush())
+        if self.mode == STREAM_MODE:
+            self._stream_finish()
+        else:
+            self._handle(self.vad.flush())
 
     def _drop(self, reason, sec=0.0, text="", seq=None):
         """記一次「這段沒能變成字幕」並通知 UI。
@@ -566,6 +682,187 @@ class AudioSubtitleWorker:
                 continue
             self._emit("segment_sent", {"sec": round(sec, 2), "id": seq})
 
+    # --- 串流模式 ---------------------------------------------------------
+    #
+    # 與分段模式最大的差別：**這裡不丟棄任何語音**。VAD 降級成純粹的
+    # 省電開關（整段完全沒人聲才跳過辨識），句子的起訖交給
+    # engines/streaming.py 的 LocalAgreement-2 去長出來。
+    # 使用者快轉、跳播、暫停時最多讓我們少送幾次請求，不會讓字幕消失。
+
+    def _stream_feed(self, pcm):
+        """把 PCM 餵進 StreamingSession，時間到就排一次辨識。"""
+        self.session.add_audio(pcm)
+        if not self.session.due():
+            return
+        if self._stream_is_silent():
+            # 這一整段完全沒人聲：不送辨識，但也不丟掉音訊 ——
+            # 緩衝留著，下次有人聲時整段一起送，句首才不會被切掉。
+            self.session.mark_sent()
+            return
+        # 辨識執行緒還在忙就不排新的。串流模式的請求是「同一段音訊的
+        # 較新版本」，排隊沒有意義 —— 等它做完時，手上的緩衝已經更長了，
+        # 那時再送一次就好。硬排只會讓延遲愈積愈大（實測會塞到丟輪次）。
+        if self._asr_busy.is_set():
+            self._silence_run = 0.0
+            return
+        wav = self.session.buffer_wav()
+        prompt = self._stream_request_prompt()
+        sec = self.session.buffer_sec
+        self.session.mark_sent()
+        self._seq += 1
+        seq = self._seq
+        self._asr_busy.set()
+        try:
+            self._queue.put_nowait(("stream", wav, prompt, time.time(), seq, sec))
+        except queue.Full:  # pragma: no cover - _asr_busy 擋在前面，理論上到不了
+            self._asr_busy.clear()
+            logging.warning("串流佇列已滿，跳過這一輪辨識")
+            return
+        self._emit("segment_sent", {"sec": round(sec, 2), "id": seq})
+
+    def _stream_is_silent(self):
+        """這一輪的音訊完全沒人聲嗎（VAD 的唯一用途）。
+
+        用「這批視窗的機率最大值」而不是平均：只要有一窗像人聲就送。
+        門檻壓得很低（stream_silence_prob 預設 0.2），寧可多送幾次請求，
+        也不要因為 VAD 判錯而讓字幕消失。
+        """
+        vad = self.vad
+        if vad is None:
+            return False
+        try:
+            floor = float(self.cfg.get("stream_silence_prob",
+                                       DEFAULTS["stream_silence_prob"]))
+        except (TypeError, ValueError):
+            floor = DEFAULTS["stream_silence_prob"]
+        # last_prob 是「上次取樣到現在的峰值」，_tick_level 會讀走它；
+        # 這裡用不讀走的方式看一眼，不干擾量表。
+        return float(getattr(vad, "last_prob", 1.0)) < floor
+
+    def _stream_request_prompt(self):
+        """這一輪要送的 prompt。語言變了才重組（組一次就夠）。"""
+        lang = self.lang_lock.request_lang()
+        if lang != self._stream_lang:
+            self._stream_lang = lang
+            gloss = self.glossary.asr_prompt()[0] if self.glossary else ""
+            self._stream_prompt = asr_prompt.build_prompt(
+                gloss, lang, self.cfg.get("asr_seed_prompt"))
+            self.session.set_prompt(self._stream_prompt)
+        # 暖機期間 session 會回空字串（見 streaming.prompt_for_request）
+        return self.session.prompt_for_request()
+
+    def _stream_idle(self, seconds):
+        """沒有音訊封包（暫停／停播）時推進計時，太久就把手上的話收掉。"""
+        if not self.session.buffer_sec:
+            return
+        self._silence_run += max(0.0, float(seconds))
+        # 只有「真的完全沒有音訊封包」持續這麼久才算暫停／停播。
+        # 門檻要明顯大於一輪辨識的時間（約 1.9 秒），否則辨識還沒回來
+        # 就把緩衝清掉了。
+        hold = float(self.cfg.get("stream_idle_flush_sec", 3.0))
+        if self._silence_run >= max(2.5, hold):
+            self._silence_run = 0.0
+            self._stream_finish()
+
+    def _stream_finish(self):
+        """把 session 手上剩的字收成一條字幕（停止、暫停時）。"""
+        cue = self.session.flush()
+        if cue is not None:
+            self._emit_cue(cue, time.time())
+
+    def _process_stream(self, wav, prompt, t0, seq, sec):
+        """串流模式的一輪：辨識 → 前綴比對 → partial 事件 →（成句才）翻譯。"""
+        try:
+            self._process_stream_inner(wav, prompt, t0, seq, sec)
+        finally:
+            # 不管成功、失敗還是丟例外，都要放開「辨識中」旗標，
+            # 否則一次錯誤就會讓串流永遠停在那裡不再送任何請求。
+            self._asr_busy.clear()
+
+    def _process_stream_inner(self, wav, prompt, t0, seq, sec):
+        lang = self.lang_lock.request_lang()
+        url = self.cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
+        try:
+            t1 = time.time()
+            words, text, detected = transcribe_words(wav, url, lang, prompt=prompt)
+            asr_sec = time.time() - t1
+        except requests.RequestException as e:
+            self._emit("error", f"連不上語音辨識伺服器 {url}：{e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logging.exception("串流辨識失敗")
+            self._emit("error", f"{type(e).__name__}: {e}")
+            return
+
+        self._emit("asr_done", {"id": seq, "sec": round(asr_sec, 2), "text": text})
+        if self.lang_lock.voting and text.strip():
+            if self.lang_lock.observe(detected, text):
+                self._emit("status", self.lang_lock.status())
+
+        out = self.session.consume_result(words, text)
+        # partial：UI 靠這個即時把字長出來（確定的正常色、未定的灰色）
+        self._emit("partial", {"committed": out["committed"],
+                               "tentative": out["tentative"],
+                               "sec": round(self.session.buffer_sec, 2)})
+        cue = out["flush"]
+        if cue is not None:
+            self._emit_cue(cue, t0)
+
+    def _emit_cue(self, cue, t0):
+        """一句完成了：過幻聽濾網 → 翻譯 → subtitle 事件。
+
+        翻譯策略：**只有完整句才送翻譯**。半句翻出來的中文很怪，
+        而且每句都要花掉一次 oMLX 請求；未確定的尾巴在 partial 事件裡
+        以原文顯示就夠了。
+        """
+        text = clean_text(cue.text)
+        if not text:
+            return
+        dur = max(0.0, cue.end - cue.start)
+        verdict = self.filter.check(text, dur)
+        if verdict.drop:
+            logging.info("幻聽過濾（%s，%.1fs）：%s", verdict.reason, dur, text)
+            self._drop(DROP_REASONS.get(verdict.reason, verdict.reason),
+                       dur, text=text)
+            if verdict.retract and self._shown and                     hallucination.normalize_repeat(self._shown) ==                     hallucination.normalize_repeat(text):
+                self._emit("retract", {"src": self._shown,
+                                       "filtered": self.filter.total,
+                                       "drops": self.drop_total,
+                                       "drop_summary": self.drop_summary()})
+                self._shown = None
+            return
+        if text == self._last_text:
+            self._drop("same_as_last", dur, text=text)
+            return
+        self._last_text = text
+
+        lang = self.lang_lock.request_lang()
+        try:
+            from .translator import translate
+            t2 = time.time()
+            zh, detected_lang, info = translate(
+                text, self.cfg, source=("auto" if lang == "auto" else lang),
+                glossary=self.glossary, custom_prompt=self.custom_prompt)
+            tr_sec = time.time() - t2
+        except Exception as e:  # noqa: BLE001
+            logging.exception("翻譯失敗")
+            self._emit("error", f"{type(e).__name__}: {e}")
+            return
+
+        self._shown = text
+        self._emit("subtitle", {"src": text, "zh": zh,
+                                "lang": detected_lang or lang,
+                                "asr_sec": 0.0, "tr_sec": tr_sec,
+                                "start": round(cue.start, 2),
+                                "end": round(cue.end, 2),
+                                "translator": info.status(),
+                                "fell_back": info.fell_back,
+                                "filtered": self.filter.total,
+                                "drops": self.drop_total,
+                                "drop_summary": self.drop_summary(),
+                                "lang_status": self.lang_lock.status(),
+                                "total_sec": time.time() - t0})
+
     def _tick_progress(self):
         """講話中每 PROGRESS_INTERVAL_SEC 報一次累計秒數，讓使用者看到「還在聽」。"""
         if not self._speech_started_at:
@@ -601,12 +898,17 @@ class AudioSubtitleWorker:
         """
         while True:
             try:
-                pcm, queued_at, seq = self._queue.get(timeout=0.2)
+                item = self._queue.get(timeout=0.2)
             except queue.Empty:
                 if self._stop.is_set():
                     return          # 停止且佇列已清空才真的結束
                 continue
-            self._process(pcm, queued_at, seq)
+            if item and item[0] == "stream":
+                _, wav, prompt, queued_at, seq, sec = item
+                self._process_stream(wav, prompt, queued_at, seq, sec)
+            else:
+                pcm, queued_at, seq = item
+                self._process(pcm, queued_at, seq)
 
     def _process(self, pcm, t0=None, seq=None):
         """辨識＋翻譯一段音訊。延遲從「切段完成」算起，反映使用者實際等待時間。"""
