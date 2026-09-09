@@ -154,6 +154,49 @@ Silero 只有 8.7%，而且那些零星的窗湊不出足夠的「語音含量�
 **沒裝 `onnxruntime` 或下載失敗會自動退回能量式 VAD**，並在狀態列標明
 「VAD: 能量式（Silero 不可用：…）」——功能不會因此壞掉，只是比較容易吐幻聽。
 
+**聆聽狀態帶與 VAD 靈敏度**
+
+VAD 判掉的段落不會變成字幕。以前這件事是**靜悄悄**發生的：小聲的耳語過不了門檻就直接消失，
+畫面上毫無反應，使用者分不出「程式沒聽到」還是「聽到了正在辨識」。
+所以字幕模式開啟時，結果面板頂端會多一條**單行狀態帶**：
+
+```
+● 偵測到語音 1.2s…                              ♪ ▁▃▅▇  V ▁▃▅│▇
+  ↑ 圓點                     ↑ 現在在做什麼        ↑ 音量  ↑ VAD 機率（│＝門檻）
+```
+
+- **圓點**：灰＝聆聽中、綠＝偵測到語音、藍＝送出／辨識中、橘＝這段被丟棄（2 秒後回灰）
+- **中間文字**：「聆聽中」／「偵測到語音 1.2s…」／「送出辨識 #12（2.4s）」／
+  「辨識中 0.8s → 原文前 20 字」／「已丟棄 #13：太短 0.3s」「已丟棄：語音含量不足」
+- **右邊兩條**：音量與 VAD 機率，機率條上有一條**門檻刻線**——
+  耳語「機率 0.35 過不了 0.5」就這樣一眼看得見
+- 狀態列也會累計「已丟棄 N（幻聽 a、太短 b、語音含量不足 c）」
+
+不想要就在 ⚙ 取消「顯示聆聽狀態帶」（設定鍵 `show_listen_bar`）。
+
+**⚙ →「VAD 靈敏度」**三檔，字幕模式跑著也能即時切換（不會重載模型、不會丟掉手上那段音訊）：
+
+| 檔位 | 機率門檻 | 語音含量下限 | 什麼時候用 |
+|---|---|---|---|
+| 靈敏 `sensitive` | 0.30 | 400 ms | **耳語、小聲對話被漏掉**時調這檔 |
+| 標準 `normal` | 0.50 | 1000 ms | 預設 |
+| 嚴格 `strict` | 0.70 | 1500 ms | **BGM 吵、幻聽多**時調這檔 |
+
+⚠️ **靈敏檔不是「音量放大器」。** Silero 看的是頻譜特徵而不是音量，所以對音量其實**非常不敏感**：
+把日文測試音檔衰減 −20dB、−30dB（RMS 4040 → 404 → 128），三檔的最大語音機率**全都還是 1.000**，
+標準檔照樣切出 3 段、辨識出 3 條字幕——**「耳語會漏掉」在這個模型上大多不成立**。
+要衰減到 −60dB（RMS 4.0，幾乎是靜音）差異才出現：
+
+| 音量 | 靈敏 | 標準 | 嚴格 |
+|---|---|---|---|
+| −20 / −30dB | 3 條字幕 | 3 條字幕 | 3 條字幕 |
+| −50dB（RMS 13） | 3 條 | 3 條 | 2 條（丟 1 段：含量不足） |
+| −60dB（RMS 4） | **2 條** | 1 條 | **0 條**（3 段全丟） |
+
+所以靈敏檔真正改變的是**「一段要有多少人聲才值得送去辨識」**（1000ms → 400ms），
+救的是**短促、斷續、被 BGM 蓋住**的語音，不是單純「小聲」的語音。
+真的整體太小聲，先調系統音量比調這裡有效。
+
 語音辨識**不在這台 Windows 上跑**，而是丟給區網另一台機器的 whisper-server，
 所以這台電腦幾乎不吃 CPU，也不需要裝 CUDA 或大型模型。
 
@@ -182,8 +225,10 @@ LLM（本專案用 Mac mini 上的 [oMLX](https://github.com/jundot/omlx) 跑 Qw
 | `audio_max_chunk_sec` | `6` | 一段最長幾秒就強制切開 |
 | `subtitle_hold_sec` | `8` | 字幕在面板上停留幾秒後清空 |
 | `vad_backend` | `auto` | `auto` = 先試 Silero，拿不到退能量式；也可寫死 `silero` / `energy` |
-| `vad_threshold` | `0.5` | 語音機率門檻（Silero 官方預設值） |
-| `vad_min_voiced_ms` | `1000` | 一段裡「真的是人聲」的秒數下限，低於就不送去辨識（擋音樂殘留） |
+| `vad_sensitivity` | `normal` | VAD 靈敏度三檔：`sensitive` / `normal` / `strict`（見下方「聆聽狀態帶與 VAD 靈敏度」） |
+| `show_listen_bar` | `true` | 面板頂端是否顯示聆聽狀態帶 |
+| `vad_threshold` | 跟著靈敏度 | 語音機率門檻。留 `null` = 由 `vad_sensitivity` 決定；填數字就是個別覆寫 |
+| `vad_min_voiced_ms` | 跟著靈敏度 | 一段裡「真的是人聲」的秒數下限，低於就不送去辨識（擋音樂殘留） |
 | `vad_min_silence_ms` | `600` | 靜下來多久算一句講完（沒設就沿用 `audio_silence_sec`） |
 | `vad_speech_pad_ms` | `200` | 每段前後各留多少，句首句尾才不會被切掉 |
 | `hallucination_repeat` | `true` | 是否啟用「同一句短時間內第二次出現就當幻聽」 |
@@ -231,7 +276,8 @@ Google「注意你的腳步」）。
   4. **90 秒內第二次出現**——正規化後同一句在 90 秒內又出現、而且兩次都 ≥ 2.5 秒，
      第二條不顯示，並把第一條**從面板上收回**（第一次出現時還判不出是幻聽）。
      門檻是「兩次都很長」而不是密度：人真的會一直說「はい」，但每次都很短（≈ 1 秒）；
-     幻聽是模型填滿整個窗口，每次都拖很長。狀態列會累計「已濾 N 條幻聽」。
+     幻聽是模型填滿整個窗口，每次都拖很長。狀態列會累計
+     「已丟棄 N（幻聽 a、太短 b、語音含量不足 c）」，狀態帶則即時顯示每一段被丟的原因。
 - 與 OCR 的「自動」模式**互斥**（兩者都會搶結果面板），勾其中一個會自動取消另一個。
   手動按「翻譯」不受影響，隨時可以插一張畫面翻譯。
 - 多人同時說話、口音重、專有名詞多的內容，準確度會明顯下降。
@@ -315,7 +361,9 @@ Google 端點沒有 prompt 可給）。`prompt_mode` 設 `replace` 可以整段�
 | `audio_max_chunk_sec` | 單段最長秒數，超過就強制切開 |
 | `subtitle_hold_sec` | 字幕停留幾秒後清空面板 |
 | `vad_backend` | VAD：`auto`（先試 Silero）/ `silero` / `energy`（見「音訊字幕 → Silero VAD」） |
-| `vad_threshold` / `vad_min_voiced_ms` / `vad_min_silence_ms` / `vad_speech_pad_ms` | VAD 細部門檻，一般不用動 |
+| `vad_sensitivity` | VAD 靈敏度：`sensitive` / `normal` / `strict`（⚙ 選單可即時切換） |
+| `show_listen_bar` | 是否顯示面板頂端的聆聽狀態帶 |
+| `vad_threshold` / `vad_min_voiced_ms` / `vad_min_silence_ms` / `vad_speech_pad_ms` | VAD 細部門檻，一般不用動（前兩者留 `null` 就跟著靈敏度走） |
 | `hallucination_repeat` / `hallucination_repeat_window_sec` / `hallucination_repeat_min_dur` | 幻聽「重複撤回」規則（見「音訊字幕 → 限制」） |
 | `glossary` | 是否啟用替詞表／自訂 prompt（預設 `true`；設 `false` 連全域那份也不讀） |
 | `glossary_file` / `prompt_file` | 額外指定的詞彙表／prompt 路徑（空字串 = 只用程式目錄那份） |
@@ -377,6 +425,7 @@ glossary.txt / prompt.txt    替詞表與自訂 prompt 範本（預設整份註�
 models/silero_vad.onnx       Silero VAD 模型，第一次用到時自動下載（已 gitignore）
 tests/test_audio_subtitle.py 音訊字幕管線測試
 tests/test_vad.py            VAD 測試（含 Silero 與能量式對 BGM 的對照）
+tests/test_listen_feedback.py 聆聽狀態帶事件流與 VAD 靈敏度三檔
 tests/test_hallucination.py  幻聽過濾規則測試（含「不該誤殺」的反例）
 tests/test_glossary.py       詞彙表解析、三層套用、種子 prompt、語言投票
 tests/test_glossary_integration.py  詞彙表在翻譯入口與 OCR 路徑上真的生效
@@ -484,6 +533,52 @@ The model **downloads automatically the first time you tick "🎧字幕"** into 
 of time (it also installs `onnxruntime`). **Without `onnxruntime`, or if the download fails, it falls back
 to the energy VAD** and the status bar says so — nothing breaks, you just get more hallucinations.
 
+**The listening bar, and VAD sensitivity**
+
+Segments the VAD rejects never become subtitles, and that used to happen **silently**: a quiet whisper
+failed the threshold and simply vanished, with nothing on screen — you could not tell "it did not hear me"
+from "it heard me and is still working". So while subtitle mode is on, the result panel grows a
+**single-line status bar** at the top:
+
+```
+● Speech detected 1.2s…                         ♪ ▁▃▅▇  V ▁▃▅│▇
+  ↑ dot                    ↑ what it is doing     ↑ level  ↑ VAD prob (│ = threshold)
+```
+
+- **Dot**: grey = listening, green = speech detected, blue = sent / transcribing,
+  orange = this segment was dropped (back to grey after 2 s)
+- **Text**: listening / speech detected 1.2s… / sent for ASR #12 (2.4s) /
+  transcribing 0.8s → first 20 chars / dropped #13: too short 0.3s / dropped: not enough voiced audio
+- **Two meters**: input level and VAD probability, with a **threshold tick** on the probability bar —
+  so "0.35 never clears 0.5" is visible at a glance
+- The status line also tallies dropped segments by reason
+
+Turn it off with ⚙ → "顯示聆聽狀態帶" (`show_listen_bar`).
+
+**⚙ → "VAD 靈敏度"** offers three presets, switchable live (no model reload, no audio lost):
+
+| Preset | Probability threshold | Min voiced | When to use |
+|---|---|---|---|
+| Sensitive | 0.30 | 400 ms | **Whispers and quiet dialogue are being missed** |
+| Normal | 0.50 | 1000 ms | Default |
+| Strict | 0.70 | 1500 ms | **Loud BGM, lots of hallucinations** |
+
+⚠️ **Sensitive is not a volume boost.** Silero keys on spectral features, not loudness, so it is
+remarkably **volume-insensitive**: attenuating the Japanese test clip by −20 dB and −30 dB
+(RMS 4040 → 404 → 128) left peak speech probability at **1.000 on all three presets**, and Normal still
+produced 3 segments and 3 subtitles. **"Whispers get missed" largely does not hold for this model.**
+Differences only appear near −60 dB (RMS 4.0, effectively silence):
+
+| Level | Sensitive | Normal | Strict |
+|---|---|---|---|
+| −20 / −30 dB | 3 subtitles | 3 subtitles | 3 subtitles |
+| −50 dB (RMS 13) | 3 | 3 | 2 (1 dropped: not enough voiced) |
+| −60 dB (RMS 4) | **2** | 1 | **0** (all 3 dropped) |
+
+What Sensitive actually changes is **how much voiced audio a segment needs to be worth transcribing**
+(1000 ms → 400 ms). It rescues speech that is **short, broken up, or buried under music** — not speech
+that is merely quiet. If everything is too quiet, raising the system volume beats changing this setting.
+
 Speech recognition does **not** run on this Windows box — it is offloaded to another machine on your LAN,
 so there is no CUDA setup and almost no local CPU cost.
 
@@ -513,8 +608,10 @@ returns nothing, it falls back to Google automatically and the status bar says s
 | `audio_max_chunk_sec` | `6` | Hard cap on segment length |
 | `subtitle_hold_sec` | `8` | How long a subtitle stays before the panel clears |
 | `vad_backend` | `auto` | `auto` = try Silero, fall back to energy; or force `silero` / `energy` |
-| `vad_threshold` | `0.5` | Speech-probability threshold (Silero's own default) |
-| `vad_min_voiced_ms` | `1000` | Minimum genuinely-voiced audio in a segment before it is transcribed (this is what keeps music out) |
+| `vad_sensitivity` | `normal` | VAD preset: `sensitive` / `normal` / `strict` (see "The listening bar, and VAD sensitivity") |
+| `show_listen_bar` | `true` | Show the listening status bar at the top of the panel |
+| `vad_threshold` | follows preset | Speech-probability threshold. `null` = decided by `vad_sensitivity`; a number overrides it |
+| `vad_min_voiced_ms` | follows preset | Minimum genuinely-voiced audio in a segment before it is transcribed (this is what keeps music out) |
 | `vad_min_silence_ms` | `600` | Silence that ends a segment (falls back to `audio_silence_sec`) |
 | `vad_speech_pad_ms` | `200` | Padding kept on both ends so words are not clipped |
 | `hallucination_repeat` | `true` | Enable "same line twice in a short window = hallucination" |
@@ -565,7 +662,8 @@ close enough in practice, and the tone and Taiwanese wording are noticeably bett
      occurrences run ≥ 2.5 s, the second is suppressed and the first is **retracted from the panel**
      (there was no way to tell it was a hallucination the first time). The test is duration, not density:
      people really do say "はい" over and over, but only ever briefly (~1 s), whereas a hallucinating model
-     fills the entire window every time. The status bar keeps a running "已濾 N 條幻聽" count.
+     fills the entire window every time. The status bar keeps a running tally of dropped segments
+     by reason, and the listening bar names the reason for each one as it happens.
 - Mutually exclusive with OCR auto mode (both compete for the result panel); ticking one unticks the other.
   The manual "翻譯" button still works at any time.
 - Overlapping speakers, heavy accents and dense proper nouns noticeably reduce accuracy.

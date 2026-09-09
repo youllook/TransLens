@@ -56,10 +56,17 @@ DEFAULT_CONFIG = {
     "subtitle_hold_sec": 8,
     # VAD：auto = 先試 Silero（會分辨人聲與音樂），拿不到就退能量式並在狀態列標明
     "vad_backend": "auto",
-    "vad_threshold": 0.5,
-    "vad_min_speech_ms": 250,
+    # VAD 靈敏度三檔：sensitive / normal / strict（見 engines/vad.py SENSITIVITY）。
+    # 耳語漏掉就調靈敏，BGM 吵、幻聽多就調嚴格。
+    "vad_sensitivity": "normal",
+    # 這三個留 null＝跟著靈敏度走；填了數字就是個別覆寫，靈敏度不會蓋掉。
+    "vad_threshold": None,
+    "vad_min_speech_ms": None,
+    "vad_min_voiced_ms": None,
     "vad_min_silence_ms": 600,
     "vad_speech_pad_ms": 200,
+    # 面板頂端的聆聽狀態帶（圓點＋說明＋音量／VAD 機率量表）
+    "show_listen_bar": True,
     # 幻聽過濾（見 engines/hallucination.py）。設 false 可整條關掉。
     "hallucination_repeat": True,
     "hallucination_repeat_window_sec": 90,
@@ -181,6 +188,116 @@ def image_signature(img):
     return hashlib.md5(small.tobytes()).hexdigest()
 
 
+# ----------------------------------------------------------------------------- 聆聽狀態帶
+# 狀態帶的圓點顏色。使用者原本的困擾是「小聲的耳語被判成非語音就直接消失，
+# 畫面上毫無反應，分不出沒聽到還是在辨識中」，所以這四個狀態要一眼分得出來。
+DOT_COLORS = {
+    "idle": "#5c6470",       # 灰：聆聽中，沒偵測到語音
+    "speech": "#3fb950",     # 綠：偵測到語音，正在收
+    "working": "#4b9fff",    # 藍：送出去了／辨識中
+    "dropped": "#e3901f",    # 橘：這段被丟掉了（停留 DROP_HOLD_MS 後回灰）
+}
+DROP_HOLD_MS = 2000          # 橘點停留多久才回到灰
+
+BAR_H = 16                   # 狀態帶高度（單行）
+METER_W = 54                 # 右邊兩條量表各自的寬度
+METER_H = 5
+
+
+class ListenBar(tk.Frame):
+    """結果面板頂端那條單行的「聆聽狀態帶」。
+
+    左：狀態圓點。中：一句話說明現在在做什麼。右：音量條與 VAD 機率條，
+    機率條上有一條門檻刻線 —— 耳語「機率 0.35 過不了 0.5」要一眼看得見，
+    這是整條狀態帶存在的理由。
+
+    所有更新都是原地改（Canvas coords / itemconfig、Label configure），
+    不 pack/grid 任何東西，面板高度才不會因為狀態變化而跳動。
+    """
+
+    def __init__(self, master, fam, bg="#14171c"):
+        super().__init__(master, bg=bg, height=BAR_H)
+        self.pack_propagate(False)
+        self._bg = bg
+        self._drop_job = None
+
+        # 圓點：用 Canvas 畫，改色只要 itemconfig，不會重排版面
+        self.dot = tk.Canvas(self, width=BAR_H, height=BAR_H, bg=bg,
+                             highlightthickness=0, bd=0)
+        self.dot.pack(side="left")
+        self._dot_id = self.dot.create_oval(4, 5, 12, 13, fill=DOT_COLORS["idle"],
+                                            outline="")
+
+        # 量表放右邊：先 pack 才不會被中間的長文字擠掉
+        self.meters = tk.Canvas(self, width=METER_W * 2 + 26, height=BAR_H,
+                                bg=bg, highlightthickness=0, bd=0)
+        self.meters.pack(side="right")
+        y = BAR_H // 2 - METER_H // 2
+        self.meters.create_text(0, BAR_H // 2, text="♪", anchor="w",
+                                fill="#6b7480", font=(fam, 7))
+        x0 = 10
+        self.meters.create_rectangle(x0, y, x0 + METER_W, y + METER_H,
+                                     fill="#242932", outline="")
+        self._rms_id = self.meters.create_rectangle(x0, y, x0, y + METER_H,
+                                                    fill="#5c6470", outline="")
+        self._rms_x0 = x0
+        x1 = x0 + METER_W + 16
+        self.meters.create_text(x1 - 6, BAR_H // 2, text="V", anchor="e",
+                                fill="#6b7480", font=(fam, 7))
+        self.meters.create_rectangle(x1, y, x1 + METER_W, y + METER_H,
+                                     fill="#242932", outline="")
+        self._prob_id = self.meters.create_rectangle(x1, y, x1, y + METER_H,
+                                                     fill="#5c6470", outline="")
+        self._prob_x0 = x1
+        # 門檻刻線：畫在機率條上，跟著靈敏度移動
+        self._tick_id = self.meters.create_rectangle(
+            x1 + int(METER_W * 0.5), y - 2, x1 + int(METER_W * 0.5) + 1,
+            y + METER_H + 2, fill="#e6edf3", outline="")
+
+        self.lbl = tk.Label(self, text="聆聽中", font=(fam, 8), fg="#8b95a1",
+                            bg=bg, anchor="w")
+        self.lbl.pack(side="left", fill="x", expand=True, padx=(2, 6))
+
+    # --- 狀態
+    def set_state(self, state, text):
+        """改圓點顏色與說明文字。橘（已丟棄）會自己在 2 秒後回灰。"""
+        if self._drop_job is not None:
+            try:
+                self.after_cancel(self._drop_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self._drop_job = None
+        self.dot.itemconfig(self._dot_id, fill=DOT_COLORS.get(state, DOT_COLORS["idle"]))
+        self.lbl.configure(text=text)
+        if state == "dropped":
+            self._drop_job = self.after(DROP_HOLD_MS, self._back_to_idle)
+
+    def _back_to_idle(self):
+        self._drop_job = None
+        self.dot.itemconfig(self._dot_id, fill=DOT_COLORS["idle"])
+        self.lbl.configure(text="聆聽中")
+
+    def set_level(self, rms, prob, threshold, speaking=False):
+        """更新兩條量表與門檻刻線。只改 coords，不重建任何 widget。"""
+        y = BAR_H // 2 - METER_H // 2
+        r = max(0.0, min(1.0, float(rms or 0.0)))
+        p = max(0.0, min(1.0, float(prob or 0.0)))
+        t = max(0.0, min(1.0, float(threshold or 0.5)))
+        # 音量用 sqrt 拉開低音量段：耳語的 rms 常在 0.01~0.05，線性畫幾乎看不到
+        r_disp = r ** 0.5
+        self.meters.coords(self._rms_id, self._rms_x0, y,
+                           self._rms_x0 + METER_W * r_disp, y + METER_H)
+        self.meters.coords(self._prob_id, self._prob_x0, y,
+                           self._prob_x0 + METER_W * p, y + METER_H)
+        # 過了門檻才變綠：這就是使用者要的「過得了/過不了」的視覺答案
+        self.meters.itemconfig(self._prob_id,
+                               fill="#3fb950" if p >= t else "#8a5a2b")
+        self.meters.itemconfig(self._rms_id,
+                               fill="#4b9fff" if speaking else "#5c6470")
+        tx = self._prob_x0 + int(METER_W * t)
+        self.meters.coords(self._tick_id, tx, y - 2, tx + 1, y + METER_H + 2)
+
+
 # ----------------------------------------------------------------------------- 結果面板
 class ResultPanel(tk.Toplevel):
     def __init__(self, app):
@@ -202,11 +319,16 @@ class ResultPanel(tk.Toplevel):
                                bg="#14171c", anchor="w", justify="left")
         self.lbl_src = tk.Label(self.body, text="", font=(fam, max(8, app.cfg["font_size"] - 4)),
                                 fg="#9aa3ad", bg="#14171c", anchor="w", justify="left")
+        # 聆聽狀態帶：只有字幕模式開著才 pack（OCR 模式不需要，也不該佔高度）
+        self.listen_bar = ListenBar(self.body, fam)
+        self.listen_shown = False
+
         self.lbl_status.pack(fill="x")
         self.lbl_zh.pack(fill="x", pady=(2, 0))
         self.lbl_src.pack(fill="x", pady=(4, 0))
 
-        for w in (self, self.body, self.lbl_status, self.lbl_zh, self.lbl_src):
+        for w in (self, self.body, self.lbl_status, self.lbl_zh, self.lbl_src,
+                  self.listen_bar, self.listen_bar.lbl):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<Button-3>", self._popup)
@@ -239,6 +361,19 @@ class ResultPanel(tk.Toplevel):
         fam = self.app.cfg["font_family"]
         self.lbl_zh.configure(font=(fam, size))
         self.lbl_src.configure(font=(fam, max(8, size - 4)))
+        self.follow()
+
+    def set_listen_bar(self, visible):
+        """顯示／隱藏聆聽狀態帶。只在真的要變的時候動 pack，避免無謂重排。"""
+        visible = bool(visible)
+        if visible == self.listen_shown:
+            return
+        self.listen_shown = visible
+        if visible:
+            # before=lbl_status：狀態帶固定在面板最上面那一行
+            self.listen_bar.pack(fill="x", before=self.lbl_status)
+        else:
+            self.listen_bar.pack_forget()
         self.follow()
 
     def showing_source(self, text):
@@ -291,6 +426,8 @@ class LensApp:
         self.audio_worker = None      # AudioSubtitleWorker，勾選「🎧字幕」時才建立
         self.vad_note = ""            # 狀態列顯示的 VAD 名稱（Silero / 能量式）
         self._filtered = 0            # 這一輪擋掉幾條幻聽
+        self._drops = 0               # 這一輪總共丟掉幾段（含 VAD 擋掉的）
+        self._drop_summary = ""       # 「已丟棄 N（幻聽 a、太短 b…）」
         self.subtitle_job = None      # subtitle_hold_sec 到期後清空面板的 after id
 
         self.root = tk.Tk()
@@ -459,6 +596,28 @@ class LensApp:
         g_menu.add_command(label=self._glossary_summary(), state="disabled")
         m.add_cascade(label="詞彙表／自訂 prompt", menu=g_menu)
 
+        # VAD 靈敏度：耳語漏掉調「靈敏」，BGM 吵幻聽多調「嚴格」
+        from engines import vad as vad_mod
+        v_menu = tk.Menu(m, tearoff=0, font=(fam, 10))
+        self.vad_sens_var = tk.StringVar(
+            value=self.cfg.get("vad_sensitivity", vad_mod.DEFAULT_SENSITIVITY))
+        for label, value in vad_mod.SENSITIVITY_LABELS:
+            p = vad_mod.SENSITIVITY[value]
+            v_menu.add_radiobutton(
+                label=f"{label}（門檻 {p['vad_threshold']:.1f}、"
+                      f"語音含量 {int(p['vad_min_voiced_ms'])}ms）",
+                value=value, variable=self.vad_sens_var,
+                command=self._on_vad_sensitivity)
+        v_menu.add_separator()
+        v_menu.add_command(label="耳語聽不到 → 靈敏；BGM 吵、幻聽多 → 嚴格",
+                           state="disabled")
+        m.add_cascade(label="VAD 靈敏度（🎧字幕）", menu=v_menu)
+
+        self.listen_bar_var = tk.BooleanVar(
+            value=bool(self.cfg.get("show_listen_bar", True)))
+        m.add_checkbutton(label="顯示聆聽狀態帶", variable=self.listen_bar_var,
+                          command=self._on_listen_bar_toggle)
+
         self.show_src_var = tk.BooleanVar(value=self.cfg["show_original"])
         m.add_checkbutton(label="顯示原文", variable=self.show_src_var, command=self._on_show_src)
         m.add_command(label="字級 ＋", command=lambda: self._font_delta(+2))
@@ -620,10 +779,14 @@ class LensApp:
         from engines.audio_subtitle import AudioSubtitleWorker
         self.vad_note = ""
         self._filtered = 0
+        self._drops = 0
+        self._drop_summary = ""
         self.audio_worker = AudioSubtitleWorker(
             self.cfg, lambda kind, payload: self.events.put((f"audio_{kind}", payload)))
         self.audio_worker.start()
         self.lbl_state.configure(text="🎧字幕")
+        self.panel.set_listen_bar(self.cfg.get("show_listen_bar", True))
+        self.panel.listen_bar.set_state("idle", "聆聽中")
         self.panel.show(status=self._audio_status("啟動中…"), zh="", src="")
 
     def _stop_audio(self):
@@ -633,6 +796,7 @@ class LensApp:
         if self.subtitle_job:
             self.root.after_cancel(self.subtitle_job)
             self.subtitle_job = None
+        self.panel.set_listen_bar(False)
         self.lbl_state.configure(text="自動模式" if self.auto_var.get() else "")
 
     def _audio_status(self, tail="", translator_note="", lang_status="", filtered=0):
@@ -651,9 +815,14 @@ class LensApp:
             from engines.translator import BACKEND_LABELS
             choice = self.cfg.get("translator", DEFAULT_CONFIG["translator"])
             parts.append(f"翻譯: {BACKEND_LABELS.get(choice, choice)}")
-        filtered = filtered or self._filtered
-        if filtered:
-            parts.append(f"已濾 {filtered} 條幻聽")
+        # 丟棄統計：原本只報幻聽，但被 VAD 擋掉的耳語（「語音含量不足」）
+        # 才是使用者最常遇到卻看不見的那種，所以整包一起報。
+        if self._drop_summary:
+            parts.append(self._drop_summary)
+        else:
+            filtered = filtered or self._filtered
+            if filtered:
+                parts.append(f"已濾 {filtered} 條幻聽")
         if tail:
             parts.append(tail)
         return " · ".join(parts)
@@ -670,6 +839,9 @@ class LensApp:
         if not self.audio_var.get():
             return                       # 已取消勾選，忽略在路上的殘留字幕
         self._filtered = data.get("filtered", self._filtered)
+        self._drops = data.get("drops", self._drops)
+        self._drop_summary = data.get("drop_summary", self._drop_summary)
+        self._listen_state("idle", "聆聽中")
         self.panel.show(status=self._audio_status(f"{data['total_sec']:.1f}s",
                                                   data.get("translator", ""),
                                                   data.get("lang_status", "")),
@@ -705,6 +877,67 @@ class LensApp:
             # 「擷取中：<裝置> · VAD: Silero」→ 把 VAD 那段留著給狀態列用
             self.vad_note = text.split("·")[-1].strip()
         self.panel.show(status=self._audio_status(text), zh="", src="")
+
+    def _on_vad_sensitivity(self):
+        """切換 VAD 靈敏度。worker 在跑就地生效，不重開（不重載模型、不丟音訊）。"""
+        value = self.vad_sens_var.get()
+        self.cfg["vad_sensitivity"] = value
+        # 舊 config 可能把某一檔的預設值寫死在 vad_threshold 等鍵上，那會把
+        # 靈敏度釘住。resolve_params 會忽略「原樣等於預設」的值，但存檔時
+        # 順手清掉，config.json 看起來才不會自相矛盾。
+        from engines import vad as vad_mod
+        for key in vad_mod.PARAM_KEYS:
+            if vad_mod.is_preset_value(key, self.cfg.get(key)):
+                self.cfg[key] = None
+        save_config(self.cfg)
+        w = self.audio_worker
+        if w is not None and w.running:
+            w.set_sensitivity(value)
+
+    def _on_listen_bar_toggle(self):
+        self.cfg["show_listen_bar"] = self.listen_bar_var.get()
+        save_config(self.cfg)
+        self.panel.set_listen_bar(self.cfg["show_listen_bar"]
+                                  and self.audio_var.get())
+
+    # --- 聆聽狀態帶
+    def _listen_state(self, state, text):
+        """更新狀態帶的圓點與說明。狀態帶關掉時什麼都不做。"""
+        if not self.audio_var.get() or not self.panel.listen_shown:
+            return
+        self.panel.listen_bar.set_state(state, text)
+
+    def _on_level(self, data):
+        """音量／VAD 機率量表。這是最高頻的事件，只改 Canvas 座標不重排版面。"""
+        if not self.audio_var.get() or not self.panel.listen_shown:
+            return
+        self.panel.listen_bar.set_level(data.get("rms", 0.0), data.get("prob", 0.0),
+                                        data.get("threshold", 0.5),
+                                        data.get("speaking", False))
+
+    def _on_asr_done(self, data):
+        """辨識回來了：顯示耗時與原文前 20 字，讓使用者知道「聽到的是這句」。"""
+        text = (data.get("text") or "").strip()
+        head = text[:20] + ("…" if len(text) > 20 else "")
+        tail = f" → {head}" if head else ""
+        self._listen_state("working", f"辨識中 {data.get('sec', 0.0):.1f}s{tail}")
+
+    def _on_dropped(self, data):
+        """這段沒能變成字幕。橘點 + 原因，2 秒後自己回灰（ListenBar 管）。"""
+        from engines.audio_subtitle import drop_label
+        self._drops = data.get("drops", self._drops)
+        self._drop_summary = data.get("drop_summary", self._drop_summary)
+        seq = data.get("id")
+        label = drop_label(data.get("reason"))
+        sec = data.get("sec") or 0.0
+        who = f" #{seq}" if seq else ""
+        detail = f" {sec:.1f}s" if sec else ""
+        self._listen_state("dropped", f"已丟棄{who}：{label}{detail}")
+        # 狀態列的累計數也要跟著動（使用者可能沒在看狀態帶那一瞬間）
+        if self.audio_var.get():
+            self.panel.show(status=self._audio_status("聆聽中…"),
+                            zh=self.panel.lbl_zh.cget("text"),
+                            src=self.panel.lbl_src.cget("text"))
 
     def _clear_subtitle(self):
         self.subtitle_job = None
@@ -761,6 +994,19 @@ class LensApp:
                     self._on_audio_status(payload)
                 elif kind == "audio_error":
                     self._audio_failed(payload)
+                elif kind == "audio_level":
+                    self._on_level(payload)
+                elif kind == "audio_speech_start":
+                    self._listen_state("speech", "偵測到語音…")
+                elif kind == "audio_speech_progress":
+                    self._listen_state("speech", f"偵測到語音 {payload['sec']:.1f}s…")
+                elif kind == "audio_segment_sent":
+                    self._listen_state("working",
+                                       f"送出辨識 #{payload['id']}（{payload['sec']:.1f}s）")
+                elif kind == "audio_asr_done":
+                    self._on_asr_done(payload)
+                elif kind == "audio_dropped":
+                    self._on_dropped(payload)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_events)

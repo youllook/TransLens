@@ -40,6 +40,50 @@ TARGET_WIDTH = 2             # int16
 MIN_CHUNK_SEC = 0.5          # 短於這個長度的段落直接丟掉
 FRAMES_PER_BUFFER = 1024
 
+# 聆聽狀態帶的事件節流。level 是唯一一個「不管有沒有事情發生都會一直發」
+# 的事件，不節流的話 48kHz loopback 每秒會灌進 UI 佇列上百則，面板忙著
+# 重畫量表反而會頓。100ms 對眼睛來說已經是連續的。
+LEVEL_INTERVAL_SEC = 0.1
+# 靜了這麼久才把量表歸零。loopback 常常一次只送不滿一個 buffer 的資料，
+# 「有聲音」與「這輪沒讀到」會交替出現；太短會讓量表一直閃回 0。
+LEVEL_DECAY_SEC = 0.35
+PROGRESS_INTERVAL_SEC = 0.5   # speech_progress：講話中每 0.5 秒報一次累計秒數
+
+# 幻聽過濾的 reason -> 給 UI 的 dropped reason。UI 端要顯示中文說明，
+# 用固定的鍵而不是直接把內部字串丟出去，兩邊才不會各自改各自的。
+DROP_REASONS = {
+    "garbage": "garbage",
+    "density": "density",
+    "inner_repeat": "repeat_inline",
+    "repeat": "repeat_window",
+}
+
+# dropped 的 reason -> 狀態列／狀態帶上的中文說明
+DROP_LABELS = {
+    "too_short": "太短",
+    "min_speech": "太短",
+    "min_voiced": "語音含量不足",
+    "empty": "沒辨識到內容",
+    "garbage": "幻聽",
+    "density": "字太稀",
+    "repeat_inline": "原地打轉",
+    "repeat_window": "幻聽（重複）",
+    "same_as_last": "與上一句相同",
+    "queue_full": "來不及處理",
+}
+
+
+def drop_label(reason):
+    return DROP_LABELS.get(reason, reason or "未知")
+
+
+def _sensitivity_label(name):
+    """設定值 -> 顯示名（靈敏／標準／嚴格）。"""
+    for label, value in vad_mod.SENSITIVITY_LABELS:
+        if value == name:
+            return label
+    return str(name or "標準")
+
 
 def clean_text(text: str) -> str:
     """whisper 會回多行加前後空白，壓成單行。"""
@@ -262,6 +306,23 @@ class AudioSubtitleWorker:
         kind="subtitle" payload=dict           {"src","zh","lang","asr_sec","total_sec"}
         kind="retract"  payload=dict           {"src"} 這句被判定是幻聽，請把它從面板收回
         kind="error"    payload=str            可讀錯誤訊息（worker 會停止）
+
+    以下是給 UI「聆聽狀態帶」用的細粒度事件。使用者原本的困擾是：小聲的
+    耳語被 VAD 判成非語音就直接消失，畫面上毫無反應，分不出「沒聽到」
+    還是「聽到了在辨識中」。所以每一條會靜靜丟掉的路徑都要留下事件：
+
+        kind="level"          {"rms","prob","threshold","speaking"}  約每 100ms
+        kind="speech_start"   {}
+        kind="speech_progress" {"sec"}                               每 0.5s
+        kind="segment_sent"   {"sec","id"}      送去 whisper 了
+        kind="asr_done"       {"id","sec","text"}  辨識回來了（還沒翻譯）
+        kind="dropped"        {"id","reason","sec","text"}  這段沒能變成字幕
+
+    dropped 的 reason：
+        too_short      段落比 MIN_CHUNK_SEC 還短
+        min_voiced     VAD 判「語音含量不足」（純 BGM 湊出來的段落）
+        empty          whisper 回空字串
+        garbage/density/repeat_inline/repeat_window  幻聽過濾的四條規則
     """
 
     def __init__(self, cfg, callback):
@@ -281,6 +342,11 @@ class AudioSubtitleWorker:
         self.custom_prompt = ""
         self.vad = None
         self.vad_note = ""
+        self._seq = 0                 # segment_sent / asr_done / dropped 的序號
+        self._last_level_at = 0.0     # level 事件節流用
+        self._last_progress_sec = 0.0  # speech_progress 每 0.5s 才發一次
+        self._speech_started_at = 0.0
+        self.drops = {}               # reason -> 次數（狀態列的「已丟棄 N」）
 
     # --- 生命週期
     def start(self):
@@ -289,6 +355,9 @@ class AudioSubtitleWorker:
         self._stop.clear()
         self._last_text = None
         self._shown = None
+        self._seq = 0
+        self._speech_started_at = 0.0
+        self.drops = {}
         self.filter.reset()
         self.lang_lock.set_configured(self.cfg.get("audio_lang", "auto"))
         while not self._queue.empty():        # 丟掉上一輪殘留
@@ -317,6 +386,22 @@ class AudioSubtitleWorker:
     def set_language(self, lang):
         """使用者在下拉手動選了語言：立即生效並停止投票。"""
         self.lang_lock.set_manual(lang)
+
+    def set_sensitivity(self, sensitivity=None):
+        """使用者在 ⚙ 換了 VAD 靈敏度：正在跑的 VAD 就地換門檻，不重開 worker。
+
+        重開 worker 會重載模型、丟掉手上正在收的那段音訊，使用者只是想
+        把耳語調得聽得到，不該付這個代價。回傳實際生效的參數（給測試看）。
+        """
+        if sensitivity is not None:
+            self.cfg["vad_sensitivity"] = sensitivity
+        vad = self.vad
+        if vad is None:
+            return None
+        params = vad.apply_sensitivity(self.cfg)
+        self._emit("status", f"VAD 靈敏度：{_sensitivity_label(self.cfg.get('vad_sensitivity'))}"
+                             f"（門檻 {params['vad_threshold']:.2f}）")
+        return params
 
     def _emit(self, kind, payload):
         try:
@@ -391,6 +476,7 @@ class AudioSubtitleWorker:
         self.vad.reset()
 
         last_tick = time.time()
+        last_audio_at = last_tick      # 上次真的讀到音訊的時刻（量表衰減用）
         while not self._stop.is_set():
             # WASAPI loopback 在「沒有任何程式在播放」時連靜音封包都不會送，read() 會無限卡住
             # （影片播完、暫停、對話結束後停播都會遇到）。所以只在有資料時才 read；
@@ -404,33 +490,104 @@ class AudioSubtitleWorker:
                 now = time.time()
                 self._handle(self.vad.feed_silence(now - last_tick))
                 last_tick = now
+                # 量表本身是「讀走式」的（take_level），停播後自然會歸零，
+                # 這裡只要照常取樣就好。真的靜下來超過 LEVEL_DECAY_SEC 才
+                # 送 level，避免「有聲音／這輪沒讀到」交替時量表一直閃。
+                if now - last_audio_at >= LEVEL_DECAY_SEC:
+                    self._tick_level()
+                self._tick_progress()
                 continue
             try:
                 raw = stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
             except OSError as e:
                 self._emit("error", f"音訊擷取中斷：{e}")
                 return
-            last_tick = time.time()
+            last_tick = last_audio_at = time.time()
             mono, rate_state = downmix_resample(raw, src_rate, src_channels,
                                                 TARGET_WIDTH, rate_state)
             self._handle(self.vad.feed(mono))
+            self._tick_level()
+            self._tick_progress()
 
         # 取消勾選時把手上這句也送出去，不要丟掉
         self._handle(self.vad.flush())
 
+    def _drop(self, reason, sec=0.0, text="", seq=None):
+        """記一次「這段沒能變成字幕」並通知 UI。
+
+        每一條靜靜丟掉的路徑都要走這裡 —— 少一條，使用者就又多一種
+        「講了話但畫面沒反應」而查不出原因的情況。
+        """
+        self.drops[reason] = self.drops.get(reason, 0) + 1
+        payload = {"id": seq, "reason": reason, "sec": round(float(sec), 2)}
+        if text:
+            payload["text"] = text
+        payload["drops"] = self.drop_total
+        self._emit("dropped", payload)
+
+    @property
+    def drop_total(self):
+        return sum(self.drops.values())
+
     def _handle(self, events):
-        """把 VAD 的事件轉成佇列裡的工作。"""
+        """把 VAD 的事件轉成佇列裡的工作，順便發出狀態帶要的事件。"""
         for ev in events or ():
-            if ev.get("kind") != "speech_end":
+            kind = ev.get("kind")
+            if kind == "speech_start":
+                self._speech_started_at = time.time()
+                self._last_progress_sec = 0.0
+                self._emit("speech_start", {})
                 continue
+            if kind == "speech_drop":
+                # VAD 自己就判掉了（太短、語音含量不足），根本沒送出去
+                self._drop(ev.get("reason", "min_voiced"), ev.get("sec", 0.0))
+                self._speech_started_at = 0.0
+                continue
+            if kind != "speech_end":
+                continue
+            self._speech_started_at = 0.0
             pcm = ev.get("pcm") or b""
-            if len(pcm) / float(TARGET_RATE * TARGET_WIDTH) < MIN_CHUNK_SEC:
+            sec = len(pcm) / float(TARGET_RATE * TARGET_WIDTH)
+            if sec < MIN_CHUNK_SEC:
+                self._drop("too_short", sec)
                 continue
+            self._seq += 1
+            seq = self._seq
             try:
-                self._queue.put_nowait((pcm, time.time()))
+                self._queue.put_nowait((pcm, time.time(), seq))
             except queue.Full:
                 # 伺服器塞車時寧可丟最舊的一段，也不要讓擷取停下來
                 logging.warning("音訊字幕佇列已滿，丟棄一段")
+                self._drop("queue_full", sec, seq=seq)
+                continue
+            self._emit("segment_sent", {"sec": round(sec, 2), "id": seq})
+
+    def _tick_progress(self):
+        """講話中每 PROGRESS_INTERVAL_SEC 報一次累計秒數，讓使用者看到「還在聽」。"""
+        if not self._speech_started_at:
+            return
+        sec = time.time() - self._speech_started_at
+        if sec - self._last_progress_sec >= PROGRESS_INTERVAL_SEC:
+            self._last_progress_sec = sec
+            self._emit("speech_progress", {"sec": round(sec, 1)})
+
+    def _tick_level(self):
+        """把 VAD 最近一批的音量／機率送給狀態帶（節流到 LEVEL_INTERVAL_SEC）。"""
+        vad = self.vad
+        if vad is None:
+            return
+        now = time.time()
+        if now - self._last_level_at < LEVEL_INTERVAL_SEC:
+            return
+        self._last_level_at = now
+        # 讀走式：拿到的是「上次取樣到現在的峰值」，不是剛好這一瞬間的值
+        rms, prob, speaking = vad.take_level()
+        self._emit("level", {
+            "rms": round(float(rms), 4),
+            "prob": round(float(prob), 4),
+            "threshold": round(float(getattr(vad, "prob_threshold", 0.5)), 4),
+            "speaking": bool(speaking),
+        })
 
     def _send_loop(self):
         """從佇列取出段落做辨識＋翻譯，與擷取執行緒解耦。
@@ -440,14 +597,14 @@ class AudioSubtitleWorker:
         """
         while True:
             try:
-                pcm, queued_at = self._queue.get(timeout=0.2)
+                pcm, queued_at, seq = self._queue.get(timeout=0.2)
             except queue.Empty:
                 if self._stop.is_set():
                     return          # 停止且佇列已清空才真的結束
                 continue
-            self._process(pcm, queued_at)
+            self._process(pcm, queued_at, seq)
 
-    def _process(self, pcm, t0=None):
+    def _process(self, pcm, t0=None, seq=None):
         """辨識＋翻譯一段音訊。延遲從「切段完成」算起，反映使用者實際等待時間。"""
         t0 = t0 or time.time()
         duration = len(pcm) / float(TARGET_RATE * TARGET_WIDTH)
@@ -476,6 +633,13 @@ class AudioSubtitleWorker:
             self._emit("error", f"{type(e).__name__}: {e}")
             return
 
+        self._emit("asr_done", {"id": seq, "sec": round(asr_sec, 2), "text": text})
+        if not (text or "").strip():
+            # whisper 回空字串：段落確實送出去了，但什麼都沒辨識到
+            self._drop("empty", duration, seq=seq)
+            self._emit("status", self._status_tail())
+            return
+
         if voting:
             newly = self.lang_lock.observe(detected, text)
             if newly:
@@ -487,17 +651,23 @@ class AudioSubtitleWorker:
             # 過濾掉的句子一定要留下痕跡：使用者只會覺得「有幾句沒出來」，
             # 不查 log 無從知道是被哪條規則擋的。
             logging.info("幻聽過濾（%s，%.1fs）：%s", verdict.reason, duration, text)
+            self._drop(DROP_REASONS.get(verdict.reason, verdict.reason),
+                       duration, text=text, seq=seq)
             if verdict.retract and self._shown and \
                     hallucination.normalize_repeat(self._shown) == hallucination.normalize_repeat(text):
                 # 第一次出現時還判不出是幻聽，字幕已經顯示出去了；
                 # 第二次出現才確定，所以請 UI 把先前那條收回。
                 self._emit("retract", {"src": self._shown,
-                                       "filtered": self.filter.total})
+                                       "filtered": self.filter.total,
+                                       "drops": self.drop_total,
+                                       "drop_summary": self.drop_summary()})
                 self._shown = None
             self._emit("status", self._status_tail())
             return
         if text == self._last_text:
-            return                       # 連續同一句不重複顯示
+            # 連續同一句不重複顯示。這也是一種「講了話但畫面沒動」，要留痕跡。
+            self._drop("same_as_last", duration, text=text, seq=seq)
+            return
         self._last_text = text
 
         try:
@@ -520,13 +690,31 @@ class AudioSubtitleWorker:
                                 "translator": info.status(),
                                 "fell_back": info.fell_back,
                                 "filtered": self.filter.total,
+                                "drops": self.drop_total,
+                                "drop_summary": self.drop_summary(),
                                 "lang_status": self.lang_lock.status(),
                                 "total_sec": time.time() - t0})
 
+    def drop_summary(self):
+        """狀態列那段「已丟棄 N（幻聽 a、太短 b、含量不足 c）」。沒丟過就回空字串。
+
+        原本只數幻聽，但使用者看不到的丟棄有好幾種；只報幻聽會讓
+        「耳語被 VAD 擋掉」這種最常見的情況完全不出現在畫面上。
+        """
+        if not self.drops:
+            return ""
+        # 同一個中文說明的幾種 reason 合併計數（too_short / min_speech 都是「太短」）
+        merged = {}
+        for reason, n in self.drops.items():
+            merged[drop_label(reason)] = merged.get(drop_label(reason), 0) + n
+        detail = "、".join(f"{k} {v}" for k, v in
+                           sorted(merged.items(), key=lambda kv: -kv[1]))
+        return f"已丟棄 {self.drop_total}（{detail}）"
+
     def _status_tail(self):
-        """丟掉一句之後更新狀態列（讓「已濾 N 條幻聽」跟著動）。"""
+        """丟掉一句之後更新狀態列（讓「已丟棄 N」跟著動）。"""
         parts = [self.lang_lock.status()]
-        summary = self.filter.summary()
+        summary = self.drop_summary()
         if summary:
             parts.append(summary)
         return " · ".join(parts)

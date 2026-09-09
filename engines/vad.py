@@ -18,6 +18,10 @@ whisper 對著沒有人聲的音訊硬填，就吐出「ご視聴ありがとう
     vad.feed(pcm) -> list[event]  餵 16k/int16 的 PCM，回傳這批觸發的事件
     vad.feed_silence(seconds)     沒有音訊封包時，用牆鐘推進靜音計時
     vad.label                     狀態列要顯示的名字（"Silero VAD" 等）
+    vad.last_rms / last_prob      最近一批的音量與語音機率（0~1），給
+                                  UI 的聆聽狀態帶畫量表用
+    vad.prob_threshold            機率條上那條門檻刻線該畫在哪
+    vad.apply_sensitivity(cfg)    不重開 worker 就換靈敏度（見 SENSITIVITY）
 
 事件是 dict：
     {"kind": "speech_end", "pcm": bytes}   一段語音結束，pcm 是含 padding 的整段
@@ -58,6 +62,69 @@ DEFAULTS = {
     # 1.0 秒切在中間，而且不會誤殺短句（「足元に気をつけろ」1.44 秒還在）。
     "vad_min_voiced_ms": 1000,
 }
+
+# 靈敏度三檔。使用者遇到的兩種相反症狀各有一邊可以調：
+#   sensitive  小聲的耳語過不了 0.5 → 門檻降到 0.3，語音含量門檻也一起放寬，
+#              否則門檻降了但「一段至少要有 1 秒人聲」照樣把短耳語擋掉。
+#   strict     BGM 吵、幻聽多 → 門檻拉到 0.7，並要求一段至少 1.5 秒是人聲。
+# 三個參數要一起動：只調 threshold 不動 min_voiced_ms，實際效果會被後者吃掉。
+SENSITIVITY = {
+    "sensitive": {"vad_threshold": 0.3, "vad_min_voiced_ms": 400,
+                  "vad_min_speech_ms": 150},
+    "normal": {"vad_threshold": 0.5, "vad_min_voiced_ms": 1000,
+               "vad_min_speech_ms": 250},
+    "strict": {"vad_threshold": 0.7, "vad_min_voiced_ms": 1500,
+               "vad_min_speech_ms": 300},
+}
+DEFAULT_SENSITIVITY = "normal"
+
+# ⚙ 選單用的顯示名（顯示名 -> 設定值）
+SENSITIVITY_LABELS = [("靈敏", "sensitive"), ("標準", "normal"), ("嚴格", "strict")]
+
+
+def sensitivity_params(name):
+    """三檔名稱 -> 參數 dict。不認得的名字退回 normal。"""
+    return dict(SENSITIVITY.get(str(name or "").strip().lower(),
+                                SENSITIVITY[DEFAULT_SENSITIVITY]))
+
+
+PARAM_KEYS = ("vad_threshold", "vad_min_voiced_ms", "vad_min_speech_ms")
+
+
+def is_preset_value(key, value):
+    """這個 config 值是不是某一檔靈敏度的原樣預設值。
+
+    舊版把三檔的預設值直接寫進 config.json（那時候還沒有靈敏度這回事）。
+    如果照單全收當成「使用者的個別覆寫」，切到「靈敏」就會被 0.5 釘住、
+    完全沒有效果 —— 使用者會以為這個功能壞了。所以只有「跟任何一檔預設
+    都不一樣」的值才算真的是使用者手動調過的。
+    """
+    if value is None:
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return any(float(preset[key]) == v for preset in SENSITIVITY.values())
+
+
+def resolve_params(cfg=None):
+    """把 cfg 解析成實際生效的三個 VAD 參數。
+
+    先取靈敏度預設，再讓 config 裡「真的被手動調過」的值覆寫過去。
+    照原樣等於某一檔預設的值不算覆寫（見 is_preset_value）。
+    """
+    cfg = cfg or {}
+    params = sensitivity_params(cfg.get("vad_sensitivity", DEFAULT_SENSITIVITY))
+    for key in PARAM_KEYS:
+        value = cfg.get(key)
+        if value is None or is_preset_value(key, value):
+            continue
+        try:
+            params[key] = float(value)
+        except (TypeError, ValueError):
+            pass
+    return params
 
 
 def model_dir():
@@ -213,12 +280,17 @@ class _Segmenter:
         self.pre = bytearray()
         self.speech_sec = 0.0
         self.silence_sec = 0.0
+        dur = len(pcm) / float(TARGET_RATE * TARGET_WIDTH)
         if speech_sec < self.min_speech_sec or not pcm:
-            return []
+            # 丟掉也要留下痕跡：使用者看著狀態帶，只知道「剛剛講的話沒出來」，
+            # 沒有事件就分不出是沒聽到還是被擋掉（見 audio_subtitle 的 dropped）。
+            return [{"kind": "speech_drop", "reason": "min_speech",
+                     "sec": dur, "voiced_sec": speech_sec}] if pcm else []
         # 語音含量太低：這是音樂／環境音偶爾衝過門檻湊出來的一段，
         # 送去 whisper 只會換回一句幻聽。強制切段（講太久）不受這條限制。
         if not force and speech_sec < self.min_voiced_sec:
-            return []
+            return [{"kind": "speech_drop", "reason": "min_voiced",
+                     "sec": dur, "voiced_sec": speech_sec}]
         return [{"kind": "speech_end", "pcm": pcm, "voiced_sec": speech_sec}]
 
     def flush(self):
@@ -239,33 +311,101 @@ class _BaseVAD:
     def __init__(self, cfg=None, max_chunk_sec=0.0):
         cfg = cfg or {}
         self.cfg = cfg
+        params = resolve_params(cfg)
+        self.threshold = float(params["vad_threshold"])
         self.seg = _Segmenter(
-            min_speech_ms=float(cfg.get("vad_min_speech_ms",
-                                        DEFAULTS["vad_min_speech_ms"])),
+            min_speech_ms=float(params["vad_min_speech_ms"]),
             min_silence_ms=float(cfg.get("vad_min_silence_ms",
                                          _silence_ms_from(cfg))),
             speech_pad_ms=float(cfg.get("vad_speech_pad_ms",
                                         DEFAULTS["vad_speech_pad_ms"])),
             max_chunk_sec=max_chunk_sec,
-            min_voiced_ms=(float(cfg.get("vad_min_voiced_ms",
-                                         DEFAULTS["vad_min_voiced_ms"]))
+            min_voiced_ms=(float(params["vad_min_voiced_ms"])
                            if self.uses_voiced_gate else 0),
         )
         self._tail = bytearray()       # 不滿一窗的尾巴，等下一批補齊
+        # 最近一批的量表，給 UI 的聆聽狀態帶用（見 audio_subtitle 的 level 事件）。
+        # 取「這批裡最大的一窗」而不是平均：使用者要看的是「有沒有衝到門檻」，
+        # 平均會把一句話裡的靜音也算進去，把耳語壓得更看不見。
+        self.last_rms = 0.0            # 0~1 正規化
+        self.last_prob = 0.0           # 0~1（能量式是 rms 對門檻的比例）
+        self.last_speaking = False
+
+    def apply_sensitivity(self, cfg):
+        """套用新的靈敏度設定到「正在跑」的 VAD。
+
+        使用者在 ⚙ 切靈敏度時不該重開 worker（重開會重載模型、丟掉手上
+        那段音訊）。三個參數都是純數字門檻，就地改掉就生效，不動狀態機
+        內部的緩衝與 LSTM state。
+        """
+        self.cfg = cfg = dict(cfg or {})
+        params = resolve_params(cfg)
+        self.threshold = float(params["vad_threshold"])
+        self.seg.min_speech_sec = max(0.0, float(params["vad_min_speech_ms"]) / 1000.0)
+        if self.uses_voiced_gate:
+            self.seg.min_voiced_sec = max(0.0,
+                                          float(params["vad_min_voiced_ms"]) / 1000.0)
+        return params
 
     def reset(self):
         self.seg.reset()
         self._tail = bytearray()
+        self.last_rms = 0.0
+        self.last_prob = 0.0
+        self.last_speaking = False
 
     def feed(self, pcm: bytes):
         """餵 16k/int16 單聲道 PCM，回傳事件 list。"""
         events = []
         self._tail += pcm
+        peak_rms = peak_prob = 0.0
+        speaking = False
+        n = 0
         while len(self._tail) >= WINDOW_BYTES:
             window = bytes(self._tail[:WINDOW_BYTES])
             del self._tail[:WINDOW_BYTES]
-            events.extend(self.seg.push(window, self._is_speech(window)))
+            is_speech = self._is_speech(window)
+            n += 1
+            speaking = speaking or is_speech
+            peak_rms = max(peak_rms, _rms(window) / 32768.0)
+            # _is_speech() 剛剛已經算過這一窗的機率並存進 _prob；再算一次
+            # 等於把 Silero 的推論成本翻倍，所以這裡只讀不算。
+            peak_prob = max(peak_prob, self._prob)
+            events.extend(self.seg.push(window, is_speech))
+        if n:
+            # 取「上次被讀走之後的最大值」而不是「這一次 feed 的最大值」：
+            # 呼叫端每 100ms 才取樣一次，中間可能 feed 了好幾批，直接覆寫
+            # 會讓量表取樣到剛好最小的那一批，耳語就更看不見了。
+            # last_peak_read() 讀走後才歸零。
+            self.last_rms = max(self.last_rms, min(1.0, peak_rms))
+            self.last_prob = max(self.last_prob, min(1.0, peak_prob))
+            self.last_speaking = self.last_speaking or speaking
         return events
+
+    def take_level(self):
+        """讀走目前累積的峰值並歸零，回傳 (rms, prob, speaking)。
+
+        讀走式（而不是單純讀取）才能讓「兩次取樣之間的最大值」被看到，
+        又不會讓舊的峰值一直卡在量表上。
+        """
+        rms, prob, speaking = self.last_rms, self.last_prob, self.last_speaking
+        self.last_rms = self.last_prob = 0.0
+        self.last_speaking = False
+        return rms, prob, speaking
+
+    # 最近一窗的「語音程度」0~1，由 _is_speech() 順手寫進來，feed() 只讀不算。
+    # Silero 是模型機率；能量式沒有機率可言，用 rms 對門檻的比例代替 ——
+    # 兩者的共同語意是「離門檻還有多遠」，畫成同一條刻度才有意義。
+    _prob = 0.0
+
+    @property
+    def prob_threshold(self) -> float:
+        """狀態帶上那條門檻刻線該畫在 0~1 的哪裡。
+
+        Silero 就是 threshold 本身；能量式的門檻是自適應的絕對音量，
+        換算成同一條刻度後固定落在 0.5（見 EnergyVAD._is_speech）。
+        """
+        return float(self.threshold)
 
     def feed_silence(self, seconds: float):
         return self.seg.add_silence(seconds)
@@ -297,6 +437,8 @@ class EnergyVAD(_BaseVAD):
     """
 
     label = "能量式 VAD"
+    # 能量門檻是自適應的絕對音量，_is_speech 把它正規化成固定的 0.5
+    prob_threshold = 0.5
 
     def __init__(self, cfg=None, max_chunk_sec=0.0):
         super().__init__(cfg, max_chunk_sec)
@@ -310,6 +452,9 @@ class EnergyVAD(_BaseVAD):
     def _is_speech(self, window: bytes) -> bool:
         level = _rms(window)
         threshold = max(self.noise_floor * 3.0, self.abs_floor)
+        # 「離門檻還有多遠」換算成 0~1：剛好踩到門檻是 0.5，這樣狀態帶上
+        # 的門檻刻線畫在 0.5 對兩種 VAD 都成立（Silero 的刻線畫在 threshold）。
+        self._prob = min(1.0, (level / threshold) * 0.5) if threshold > 0 else 0.0
         if level < threshold:
             # 噪音底慢慢跟隨環境音量，不同片子的底噪都能自適應
             self.noise_floor = self.noise_floor * 0.95 + level * 0.05
@@ -363,9 +508,8 @@ class SileroVAD(_BaseVAD):
 
     def __init__(self, cfg=None, max_chunk_sec=0.0, path=None, session=None,
                  progress=None):
+        # threshold 由 _BaseVAD 從 resolve_params()（靈敏度 + config 覆寫）算好
         super().__init__(cfg, max_chunk_sec)
-        self.threshold = float((cfg or {}).get("vad_threshold",
-                                               DEFAULTS["vad_threshold"]))
         if session is not None:
             self.session = session
             self.path = path or "(injected)"
@@ -382,7 +526,7 @@ class SileroVAD(_BaseVAD):
         self._np = __import__("numpy")
         self._state = self._zero_state()
         self._context = self._zero_context()
-        self.last_prob = 0.0
+        self._prob = 0.0
 
     def _zero_state(self):
         return self._np.zeros((2, 1, 128), dtype=self._np.float32)
@@ -394,7 +538,7 @@ class SileroVAD(_BaseVAD):
         super().reset()
         self._state = self._zero_state()
         self._context = self._zero_context()
-        self.last_prob = 0.0
+        self._prob = 0.0
 
     def probability(self, window: bytes) -> float:
         """一窗的語音機率。窗長不足就補零（只發生在最後一窗）。"""
@@ -409,8 +553,8 @@ class SileroVAD(_BaseVAD):
             None, {"input": padded, "state": self._state,
                    "sr": np.array(TARGET_RATE, dtype=np.int64)})
         self._context = x[-self.CONTEXT_SAMPLES:].copy()
-        self.last_prob = float(np.asarray(out).reshape(-1)[0])
-        return self.last_prob
+        self._prob = float(np.asarray(out).reshape(-1)[0])
+        return self._prob
 
     def _is_speech(self, window: bytes) -> bool:
         return self.probability(window) >= self.threshold
