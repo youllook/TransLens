@@ -118,6 +118,56 @@ Google 個人帳號的免費層已不再支援 Gemini CLI 登入；改用 API ke
 OCR 只能翻**畫面上看得到的字**。影片本身沒有字幕、或只有聽得到的旁白時，勾工具列的
 **「🎧字幕」**：TransLens 會聽 Windows 的系統聲音，即時辨識並翻成繁體中文，顯示在同一個結果面板。
 
+**辨識引擎：Whisper / Parakeet**
+
+⚙ →「辨識引擎」有兩個，隨時可切、即時生效（不重開、不丟緩衝，下一輪辨識就換過去）：
+
+| | **Whisper**（預設） | **Parakeet** |
+|---|---|---|
+| 語言 | 多語言＋自動偵測 | **目前只有日文** |
+| 每輪辨識耗時 | 約 1.8 秒 | **約 0.25 秒** |
+| 短音訊的行為 | 聽不清楚就**硬猜**，而且一路改 | 只吐聽得懂的部分，**不回頭改** |
+| 串流送出間隔 | 1.0 秒 | 0.5 秒（每輪便宜，送得密才划算） |
+| 標點種子 prompt | 有（誘導它打標點，flush 靠標點） | **不吃**（CTC/TDT 沒有 prompt 條件化），不送 |
+| 服務 | Mac 上的 whisper-server（埠 8178） | Mac 上的 Parakeet 服務（**埠 8179**） |
+
+**為什麼要有第二個引擎**：串流模式用 LocalAgreement-2，要**連續兩輪結果一致**才把字定案。
+這個演算法的成敗完全取決於「辨識結果會不會隨音訊變長而單調成長」。實測同一段日文音訊
+由短到長餵進去（`seg.wav`）：
+
+| 音訊 | whisper large-v3-turbo | parakeet-tdt_ctc-0.6b-ja |
+|---|---|---|
+| 3s | ちょっと動かさ（錯） | うんとじゃあ（正確前綴） |
+| 5s | じゃあ次の問題（半對） | うんとじゃあ次の問題は（對） |
+| 9s | じゃあ、今は何だよ。山田!（錯） | うんとじゃあ次の問題を山田だ!（對） |
+| 15s | 正確，耗時 1.87s | 正確，**耗時 0.35s** |
+
+whisper 每一輪的前綴都不一樣，「連兩輪一致」永遠湊不齊 —— 前面幾秒的字定不下來，
+延遲就一路累積。Parakeet 的前綴保留率實測 91~100%，兩輪一致很快就成立。
+
+**實測對照**（15 秒四句，每 100ms 餵一次、真實牆鐘節奏 —— 最接近實際看影片的體感）：
+
+| 句子 | Whisper 確定於 | Parakeet 確定於 |
+|---|---|---|
+| じゃあ次の問題を | **未確定**（被幻聽蓋掉） | **6.2 秒** |
+| また寝てるの? | 20.8 秒 | **11.8 秒** |
+| 廊下に立ってなさい | 26.1 秒 | **14.3 秒** |
+| ほら早く | 28.3 秒 | **15.3 秒** |
+| 每輪耗時 | 1.82 秒 | **0.27 秒** |
+| 跑完 15 秒音訊實際花 | 28.3 秒（**落後 13 秒**） | **15.3 秒（跟得上即時）** |
+
+whisper 那一欄的第一句不但沒確定，還被 prompt 回音「はい、じゃあ、始めましょう。」蓋掉了 ——
+這正是「短音訊硬猜」的典型症狀。
+
+**什麼時候用哪個**
+
+* **看日文影片 → Parakeet**。延遲從十幾秒降到 2~3 秒，而且不會漏第一句。
+* **其他語言、或需要自動偵測語言 → Whisper**。Parakeet 目前只有日文模型
+  （服務端有英文模型的懶載入路徑，但 TransLens 這端還沒驗過，`audio_lang=en`
+  時建議仍用 Whisper）。
+* Parakeet 需要那台 Mac 上跑著埠 8179 的服務（安裝見 `docs/mac/README.md`）；
+  沒跑起來時狀態列會顯示連線錯誤，切回 Whisper 即可。
+
 **字幕模式：串流 / 分段**
 
 ⚙ →「字幕模式」有兩種，隨時可切、即時生效：
@@ -309,7 +359,9 @@ LLM（本專案用 Mac mini 上的 [oMLX](https://github.com/jundot/omlx) 跑 Qw
 
 | 鍵 | 預設 | 意義 |
 |---|---|---|
+| `asr_backend` | `whisper` | 辨識引擎：`whisper`（多語言）/ `parakeet`（只有日文，延遲低）|
 | `whisper_server_url` | `http://192.168.0.87:8178/inference` | whisper-server 的 inference 端點 |
+| `parakeet_server_url` | `http://192.168.0.87:8179/inference` | Parakeet 服務的 inference 端點 |
 | `audio_lang` | `auto` | 辨識語言：`auto` / `ja` / `en`（工具列下拉可即時切換） |
 | `audio_silence_sec` | `0.6` | 靜音多久算一句結束 |
 | `audio_max_chunk_sec` | `6` | 一段最長幾秒就強制切開 |
@@ -443,7 +495,9 @@ Google 端點沒有 prompt 可給）。`prompt_mode` 設 `replace` 可以整段�
 | `gemini_model` | Gemini API 引擎用的模型名 |
 | `gemini_cli_model` | Gemini CLI 引擎的 `-m` 參數；空字串 = CLI 預設 |
 | `claude_model` | Claude API 引擎用的模型名 |
+| `asr_backend` | 辨識引擎：`whisper`（預設）/ `parakeet`（見「辨識引擎」） |
 | `whisper_server_url` | 音訊字幕的 whisper-server 端點（見「音訊字幕」） |
+| `parakeet_server_url` | Parakeet 辨識服務端點（見「辨識引擎」） |
 | `audio_lang` | 音訊字幕辨識語言：`auto` / `ja` / `en` |
 | `translator` | 翻譯來源：`local`（區網 LLM，預設）/ `google`（見「音訊字幕 → 翻譯來源」） |
 | `local_llm_url` / `local_llm_model` / `local_llm_api_key` / `local_llm_timeout_sec` | 本地 LLM 連線設定；api key 建議改用環境變數 `OMLX_API_KEY` |
@@ -588,6 +642,58 @@ Hotkeys and everything else live in `config.json` (created on first run; see `co
 OCR can only translate text you can *see*. When a video has no subtitles at all — just spoken narration —
 tick **"🎧字幕"** in the toolbar: TransLens listens to Windows system audio, transcribes it, and shows a
 Traditional Chinese translation in the same result panel.
+
+**ASR engine: Whisper vs. Parakeet**
+
+⚙ → "辨識引擎" offers two engines; switching takes effect immediately (no restart, no buffer loss —
+the next recognition round uses the new one).
+
+| | **Whisper** (default) | **Parakeet** |
+|---|---|---|
+| Languages | multilingual + auto-detect | **Japanese only, for now** |
+| Time per round | ~1.8 s | **~0.25 s** |
+| Behavior on short audio | **guesses** when unsure, and keeps rewriting | emits only what it is sure of, **never rewrites** |
+| Streaming interval | 1.0 s | 0.5 s (each round is cheap, so send more often) |
+| Punctuation seed prompt | yes (flush relies on punctuation) | **not supported** (CTC/TDT has no prompt conditioning); not sent |
+| Service | whisper-server on the Mac (port 8178) | Parakeet service on the Mac (**port 8179**) |
+
+**Why a second engine.** Streaming mode uses LocalAgreement-2: text is finalized only when **two
+consecutive rounds agree**. That algorithm lives or dies on whether results grow *monotonically* as
+more audio arrives. Feeding the same Japanese clip (`seg.wav`) in growing prefixes:
+
+| Audio | whisper large-v3-turbo | parakeet-tdt_ctc-0.6b-ja |
+|---|---|---|
+| 3 s | ちょっと動かさ (wrong) | うんとじゃあ (correct prefix) |
+| 5 s | じゃあ次の問題 (partly right) | うんとじゃあ次の問題は (right) |
+| 9 s | じゃあ、今は何だよ。山田! (wrong) | うんとじゃあ次の問題を山田だ! (right) |
+| 15 s | correct, 1.87 s | correct, **0.35 s** |
+
+Whisper's prefix differs every round, so "two rounds agree" never happens for the opening seconds and
+latency piles up. Parakeet keeps 91–100 % of its previous prefix, so agreement arrives quickly.
+
+**Measured comparison** (15 s, four lines, fed every 100 ms in real wall-clock time — the closest
+thing to actually watching a video):
+
+| Line | Whisper finalized at | Parakeet finalized at |
+|---|---|---|
+| じゃあ次の問題を | **never** (lost to a hallucination) | **6.2 s** |
+| また寝てるの? | 20.8 s | **11.8 s** |
+| 廊下に立ってなさい | 26.1 s | **14.3 s** |
+| ほら早く | 28.3 s | **15.3 s** |
+| Time per round | 1.82 s | **0.27 s** |
+| Wall time for 15 s of audio | 28.3 s (**13 s behind**) | **15.3 s (keeps up)** |
+
+Whisper not only missed the first line, it replaced it with an echo of its own seed prompt
+("はい、じゃあ、始めましょう。") — the textbook symptom of guessing on short audio.
+
+**Which to use**
+
+* **Watching Japanese video → Parakeet.** Latency drops from ~13 s to 2–3 s, and the first line survives.
+* **Any other language, or when auto-detect is needed → Whisper.** Parakeet currently ships a Japanese
+  model only (the service has a lazy-load path for an English model, but the TransLens side has not been
+  validated with it; keep Whisper for `audio_lang=en`).
+* Parakeet requires the port-8179 service running on the Mac (setup in `docs/mac/README.md`). If it is
+  down, the status bar shows a connection error — switch back to Whisper.
 
 **Subtitle mode: streaming vs. segmented**
 
@@ -752,7 +858,9 @@ returns nothing, it falls back to Google automatically and the status bar says s
 
 | Key | Default | Meaning |
 |---|---|---|
+| `asr_backend` | `whisper` | ASR engine: `whisper` (multilingual) / `parakeet` (Japanese only, low latency) |
 | `whisper_server_url` | `http://192.168.0.87:8178/inference` | whisper-server inference endpoint |
+| `parakeet_server_url` | `http://192.168.0.87:8179/inference` | Parakeet service inference endpoint |
 | `audio_lang` | `auto` | Recognition language: `auto` / `ja` / `en` (also a toolbar dropdown) |
 | `audio_silence_sec` | `0.6` | Silence that ends a segment |
 | `audio_max_chunk_sec` | `6` | Hard cap on segment length |

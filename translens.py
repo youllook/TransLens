@@ -50,6 +50,10 @@ DEFAULT_CONFIG = {
     "gemini_cli_model": "",
     "claude_model": "claude-opus-5",
     "whisper_server_url": "http://192.168.0.87:8178/inference",
+    "parakeet_server_url": "http://192.168.0.87:8179/inference",
+    # 辨識引擎：whisper（多語言、預設）／ parakeet（只有日文，但短音訊
+    # 不亂猜，串流延遲從 13 秒降到 2~3 秒）。差異見 README「辨識引擎」一節。
+    "asr_backend": "whisper",
     "audio_lang": "auto",
     "audio_silence_sec": 0.6,
     "audio_max_chunk_sec": 6,
@@ -58,8 +62,10 @@ DEFAULT_CONFIG = {
     #           segment = 舊的 VAD 切段（等句子講完才送）
     # 兩者的差別、延遲與適用時機見 README「字幕模式」一節。
     "subtitle_mode": "stream",
-    # 串流模式：多久送一次辨識、緩衝上限、判定「完全沒人聲」的機率門檻
-    "stream_interval_sec": 1.0,
+    # 串流模式：多久送一次辨識、緩衝上限、判定「完全沒人聲」的機率門檻。
+    # interval 留 null＝依辨識引擎取預設（whisper 1.0 秒、Parakeet 0.5 秒，
+    # 因為 Parakeet 每輪只要 0.25 秒，送得密才划算）；填數字就是明確覆寫。
+    "stream_interval_sec": None,
     "stream_max_buffer_sec": 25,
     "stream_silence_prob": 0.2,
     # VAD：auto = 先試 Silero（會分辨人聲與音樂），拿不到就退能量式並在狀態列標明
@@ -634,8 +640,23 @@ class LensApp:
         g_menu.add_command(label=self._glossary_summary(), state="disabled")
         m.add_cascade(label="詞彙表／自訂 prompt", menu=g_menu)
 
-        # 字幕模式：串流（邊聽邊出字）／分段（等句子講完）
+        # 辨識引擎：Whisper（多語言）／ Parakeet（日文，延遲低）
         from engines import audio_subtitle as audio_mod
+        eng_menu = tk.Menu(m, tearoff=0, font=(fam, 10))
+        self.asr_backend_var = tk.StringVar(value=audio_mod.asr_backend(self.cfg))
+        for label, value in audio_mod.ASR_BACKENDS:
+            eng_menu.add_radiobutton(label=label, value=value,
+                                     variable=self.asr_backend_var,
+                                     command=self._on_asr_backend)
+        eng_menu.add_separator()
+        eng_menu.add_command(label="Whisper：多語言＋語言偵測，但短音訊會亂猜（串流延遲約 13 秒）",
+                             state="disabled")
+        eng_menu.add_command(label="Parakeet：目前只有日文，結果不回頭改（串流延遲約 2~3 秒）",
+                             state="disabled")
+        eng_menu.add_command(label=f"端點：{audio_mod.asr_url(self.cfg)}", state="disabled")
+        m.add_cascade(label="辨識引擎（🎧字幕）", menu=eng_menu)
+
+        # 字幕模式：串流（邊聽邊出字）／分段（等句子講完）
         sm_menu = tk.Menu(m, tearoff=0, font=(fam, 10))
         self.sub_mode_var = tk.StringVar(value=audio_mod.subtitle_mode(self.cfg))
         for label, value in audio_mod.SUBTITLE_MODES:
@@ -859,13 +880,17 @@ class LensApp:
 
     def _audio_status(self, tail="", translator_note="", lang_status="", filtered=0):
         """狀態列：字幕 · whisper@<host> · <語言> · VAD · 翻譯: <來源 耗時> · <耗時>"""
-        url = self.cfg.get("whisper_server_url", "")
-        host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0] or "?"
-        # 語言：投票鎖定後 worker 會回報「語言：ja（已鎖定）」，還沒有就顯示設定值
         from engines import audio_subtitle as audio_mod
+        url = audio_mod.asr_url(self.cfg)
+        host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0] or "?"
+        # 引擎名也要顯示 —— 兩個引擎的行為差很多（Parakeet 只有日文、
+        # 不吃 prompt），出問題時第一眼就要看得出現在用的是哪一個。
+        engine = ("parakeet" if audio_mod.asr_backend(self.cfg) == audio_mod.PARAKEET_BACKEND
+                  else "whisper")
+        # 語言：投票鎖定後 worker 會回報「語言：ja（已鎖定）」，還沒有就顯示設定值
         mode = audio_mod.subtitle_mode(self.cfg)
         parts = ["字幕", "串流" if mode == audio_mod.STREAM_MODE else "分段",
-                 f"whisper@{host}",
+                 f"{engine}@{host}",
                  lang_status or self._lang_status() or self.cfg.get("audio_lang", "auto")]
         # 串流模式的 VAD 只是省電開關，不決定句子起訖，標明一下免得
         # 使用者以為靈敏度還會像分段模式那樣影響「有沒有字幕」。
@@ -957,6 +982,26 @@ class LensApp:
         w = self.audio_worker
         if w is not None and w.running:
             w.set_sensitivity(value)
+
+    def _on_asr_backend(self):
+        """切換辨識引擎。worker 在跑就地生效（不重開、不丟緩衝）。
+
+        下一輪辨識就會打新端點；已確定的字不回頭改。狀態列的
+        「whisper@host / parakeet@host」也會跟著換（見 _audio_status）。
+        """
+        from engines import audio_subtitle as audio_mod
+        value = self.asr_backend_var.get()
+        # 舊 config 可能把某個引擎的預設 interval 寫死（例如 1.0），那會把
+        # 秒數釘在 whisper 的節奏上，切到 Parakeet 也享受不到 0.5 秒。
+        # 跟 VAD 靈敏度同樣的處理：值「原樣等於某個引擎的預設」就清成 null，
+        # 讓它跟著引擎走；使用者刻意填的其他數字（例如 2.0）保留不動。
+        if self.cfg.get("stream_interval_sec") in audio_mod.BACKEND_STREAM_INTERVAL.values():
+            self.cfg["stream_interval_sec"] = None
+        self.cfg["asr_backend"] = value
+        save_config(self.cfg)
+        w = self.audio_worker
+        if w is not None and w.running:
+            w.set_backend(value)
 
     def _on_subtitle_mode(self):
         """切換字幕模式。worker 在跑就地生效（不重開、不丟音訊）。"""

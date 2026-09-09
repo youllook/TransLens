@@ -2,7 +2,8 @@
 
 流程：
     WASAPI loopback 擷取 → Silero VAD 切段（退路：能量式）→ 打包 16k 單聲道 WAV
-    → POST {whisper_server_url}（whisper.cpp server 的 /inference，帶標點種子＋詞彙表 prompt）
+    → POST 辨識端點（asr_backend 決定：whisper-server 或 Parakeet 服務，
+      whisper 帶標點種子＋詞彙表 prompt，Parakeet 不吃 prompt）
     → 幻聽過濾（四條規則，含 90 秒內第二次出現就撤回）
     → translator.translate()（本地 LLM，失敗退 Google；套詞彙表三層）→ callback 回主執行緒
 
@@ -229,7 +230,7 @@ def recognize_and_translate(wav_bytes: bytes, cfg: dict, prompt=None, language=N
     hall_filter 給 Filter 實例就用它的四條規則（含跨句的 90 秒重複），
     沒給就只做「單句就能判」的那三條 —— 單元測試與單次呼叫用得到。
     """
-    url = cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
+    url = asr_url(cfg)
     lang = language or cfg.get("audio_lang", DEFAULTS["audio_lang"])
 
     if glossary is None and custom_prompt is None:
@@ -239,6 +240,8 @@ def recognize_and_translate(wav_bytes: bytes, cfg: dict, prompt=None, language=N
         gloss_prompt = glossary.asr_prompt()[0] if glossary else ""
         prompt = asr_prompt.build_prompt(gloss_prompt, lang,
                                          cfg.get("asr_seed_prompt"))
+    if not backend_wants_prompt(asr_backend(cfg)):
+        prompt = ""
 
     t0 = time.time()
     text = transcribe(wav_bytes, url, lang, prompt=prompt)
@@ -269,16 +272,107 @@ def _wav_duration(wav_bytes: bytes) -> float:
 
 DEFAULTS = {
     "whisper_server_url": "http://192.168.0.87:8178/inference",
+    "parakeet_server_url": "http://192.168.0.87:8179/inference",
+    # 辨識引擎：whisper（預設，維持現狀）／ parakeet（日文串流延遲低得多）
+    "asr_backend": "whisper",
     "audio_lang": "auto",
     "audio_silence_sec": 0.6,
     "audio_max_chunk_sec": 6,
     "subtitle_hold_sec": 8,
     # 字幕模式：stream = LocalAgreement-2 串流（預設），segment = 舊的 VAD 切段
     "subtitle_mode": "stream",
-    "stream_interval_sec": streaming.DEFAULTS["stream_interval_sec"],
+    # None 代表「依 backend 取預設」（見 stream_interval_sec()）。
+    "stream_interval_sec": None,
     "stream_max_buffer_sec": streaming.DEFAULTS["stream_max_buffer_sec"],
     "stream_silence_prob": streaming.DEFAULTS["stream_silence_prob"],
 }
+
+# --- 辨識引擎（asr_backend）------------------------------------------------
+#
+# 為什麼要有兩個引擎：LocalAgreement-2 的成敗完全取決於「辨識結果會不會
+# 隨音訊變長而單調成長」。實測同一段日文音訊由短到長餵進去：
+#
+#     音訊   whisper large-v3-turbo        parakeet-tdt_ctc-0.6b-ja
+#      3s    ちょっともっともっと（錯）      うんとじゃあ（正確前綴）
+#      5s    じゃあ次はもう一度（錯）        うんとじゃあ次の問題は（對）
+#      9s    じゃあ、次は何だろう?（錯）     次の問題を山田だ!（對）
+#     15s    正確，耗時 1.1s                正確，耗時 0.25s
+#
+# whisper 對短音訊會硬猜、而且一路改，前綴永遠湊不出「連兩輪一致」——
+# 實測即時字幕延遲 13 秒。Parakeet 不回頭改，延遲降到 2~3 秒。
+#
+# 預設仍是 whisper：它支援多語言與語言偵測，Parakeet 目前只有日文模型
+# （英文模型在 8179 服務上是懶載入的，但 TransLens 這端還沒驗過）。
+WHISPER_BACKEND = "whisper"
+PARAKEET_BACKEND = "parakeet"
+ASR_BACKENDS = [("Whisper（多語言、預設）", WHISPER_BACKEND),
+                ("Parakeet（日文，延遲低）", PARAKEET_BACKEND)]
+
+# 每個引擎的串流參數預設。Parakeet 每輪只要 0.25 秒，間隔可以壓到 0.5；
+# whisper 每輪約 1.9 秒，間隔比它短只會讓請求塞車。
+BACKEND_STREAM_INTERVAL = {
+    WHISPER_BACKEND: streaming.DEFAULTS["stream_interval_sec"],   # 1.0
+    PARAKEET_BACKEND: 0.5,
+}
+
+
+def asr_backend(cfg):
+    """設定 -> 'whisper' 或 'parakeet'。不認得的值一律當 whisper。"""
+    value = str((cfg or {}).get("asr_backend", DEFAULTS["asr_backend"]) or "").strip().lower()
+    return PARAKEET_BACKEND if value == PARAKEET_BACKEND else WHISPER_BACKEND
+
+
+def asr_backend_label(backend):
+    for label, value in ASR_BACKENDS:
+        if value == backend:
+            return label
+    return str(backend or WHISPER_BACKEND)
+
+
+def asr_url(cfg):
+    """這個 backend 該打哪個端點。"""
+    cfg = cfg or {}
+    if asr_backend(cfg) == PARAKEET_BACKEND:
+        return cfg.get("parakeet_server_url") or DEFAULTS["parakeet_server_url"]
+    return cfg.get("whisper_server_url") or DEFAULTS["whisper_server_url"]
+
+
+def backend_wants_prompt(backend):
+    """這個引擎吃 prompt 嗎。
+
+    Parakeet 是 CTC/TDT，沒有 prompt 條件化 —— 標點種子對它毫無意義，
+    送過去只是浪費頻寬。更重要的是**不送 prompt 就不會有 prompt 回音**，
+    streaming.py 的 _strip_echo 也就沒東西可剝（它只在 session.prompt
+    非空時才動作，所以連空轉都不會有）。
+    """
+    return backend != PARAKEET_BACKEND
+
+
+def stream_interval_sec(cfg):
+    """這一輪多久送一次辨識。
+
+    設定裡沒寫（或寫 null）就依 backend 取預設 —— 使用者切引擎時不必
+    自己去改秒數，Parakeet 自動變成 0.5 秒、whisper 自動回到 1.0 秒。
+    明確寫了數字就尊重使用者的設定。
+    """
+    cfg = cfg or {}
+    raw = cfg.get("stream_interval_sec")
+    if raw is not None:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return BACKEND_STREAM_INTERVAL[asr_backend(cfg)]
+
+
+def stream_session_cfg(cfg):
+    """給 StreamingSession 的設定：把「依 backend 取預設」的 interval 填進去。"""
+    cfg = cfg or {}
+    out = dict(cfg)
+    out["stream_interval_sec"] = stream_interval_sec(cfg)
+    return out
 
 # 字幕模式：⚙ 選單的顯示名 -> 設定值
 SUBTITLE_MODES = [("串流（邊聽邊出字）", "stream"), ("分段（等句子講完）", "segment")]
@@ -405,7 +499,8 @@ class AudioSubtitleWorker:
         self.drops = {}               # reason -> 次數（狀態列的「已丟棄 N」）
         # --- 串流模式（subtitle_mode="stream"）
         self.mode = subtitle_mode(cfg)
-        self.session = streaming.StreamingSession(cfg)
+        self.backend = asr_backend(cfg)
+        self.session = streaming.StreamingSession(stream_session_cfg(cfg))
         self._stream_prompt = ""      # 這一輪要送的 prompt（每次語言變了才重組）
         self._stream_lang = None
         self._silence_run = 0.0       # 連續判定為靜音的秒數（省電開關用）
@@ -423,7 +518,8 @@ class AudioSubtitleWorker:
         self._speech_started_at = 0.0
         self.drops = {}
         self.mode = subtitle_mode(self.cfg)
-        self.session = streaming.StreamingSession(self.cfg)
+        self.backend = asr_backend(self.cfg)
+        self.session = streaming.StreamingSession(stream_session_cfg(self.cfg))
         self._stream_prompt = ""
         self._stream_lang = None
         self._silence_run = 0.0
@@ -474,13 +570,44 @@ class AudioSubtitleWorker:
         elif self.vad is not None:
             self._handle(self.vad.flush())
         self.mode = new_mode
-        self.session = streaming.StreamingSession(self.cfg)
+        self.session = streaming.StreamingSession(stream_session_cfg(self.cfg))
         self._stream_prompt = ""
         self._stream_lang = None
         self._silence_run = 0.0
         self._asr_busy.clear()
         self._emit("status", f"字幕模式：{subtitle_mode_label(new_mode)}")
         return new_mode
+
+    def set_backend(self, backend=None):
+        """使用者在 ⚙ 換了辨識引擎：下一輪辨識就用新的，不重開 worker。
+
+        刻意**不重建 session、不丟掉緩衝** —— 手上那段音訊還是同一段話，
+        換引擎不該讓使用者已經講過的字消失。已確定的字也不回頭改
+        （LocalAgreement 的核心承諾），新引擎只影響之後的辨識結果。
+
+        要更新的只有兩件事：
+          * interval —— Parakeet 每輪 0.25 秒，可以送得更密（見
+            BACKEND_STREAM_INTERVAL）。session.interval 就地改掉即可。
+          * prompt —— Parakeet 不吃 prompt，切過去要把 session 的
+            prompt 清掉，_strip_echo 才不會拿著舊種子去剝正常語音。
+            切回 whisper 時 _stream_request_prompt() 會自己重組。
+
+        回傳實際生效的 backend。
+        """
+        if backend is not None:
+            self.cfg["asr_backend"] = backend
+        new_backend = asr_backend(self.cfg)
+        if new_backend == self.backend:
+            return new_backend
+        self.backend = new_backend
+        self.session.interval = stream_interval_sec(self.cfg)
+        # 逼 _stream_request_prompt() 下一輪重算（語言沒變也要重算）
+        self._stream_lang = None
+        self._stream_prompt = ""
+        if not backend_wants_prompt(new_backend):
+            self.session.set_prompt("")
+        self._emit("status", f"辨識引擎：{asr_backend_label(new_backend)}")
+        return new_backend
 
     def set_sensitivity(self, sensitivity=None):
         """使用者在 ⚙ 換了 VAD 靈敏度：正在跑的 VAD 就地換門檻，不重開 worker。
@@ -748,7 +875,16 @@ class AudioSubtitleWorker:
         return float(getattr(vad, "last_prob", 1.0)) < floor
 
     def _stream_request_prompt(self):
-        """這一輪要送的 prompt。語言變了才重組（組一次就夠）。"""
+        """這一輪要送的 prompt。語言變了才重組（組一次就夠）。
+
+        Parakeet 不吃 prompt（CTC/TDT 沒有 prompt 條件化），一律回空字串
+        並確保 session 的 prompt 也是空的 —— 否則 _strip_echo 會拿著一個
+        永遠不會出現在結果裡的種子去比對正常語音的開頭。
+        """
+        if not backend_wants_prompt(self.backend):
+            if self.session.prompt:
+                self.session.set_prompt("")
+            return ""
         lang = self.lang_lock.request_lang()
         if lang != self._stream_lang:
             self._stream_lang = lang
@@ -789,7 +925,7 @@ class AudioSubtitleWorker:
 
     def _process_stream_inner(self, wav, prompt, t0, seq, sec):
         lang = self.lang_lock.request_lang()
-        url = self.cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
+        url = asr_url(self.cfg)
         try:
             t1 = time.time()
             words, text, detected = transcribe_words(wav, url, lang, prompt=prompt)
@@ -927,7 +1063,9 @@ class AudioSubtitleWorker:
         gloss_prompt = self.glossary.asr_prompt()[0] if self.glossary else ""
         prompt = asr_prompt.build_prompt(gloss_prompt, lang,
                                          self.cfg.get("asr_seed_prompt"))
-        url = self.cfg.get("whisper_server_url", DEFAULTS["whisper_server_url"])
+        if not backend_wants_prompt(self.backend):
+            prompt = ""       # Parakeet 不吃 prompt
+        url = asr_url(self.cfg)
 
         try:
             t1 = time.time()

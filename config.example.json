@@ -14,6 +14,8 @@
   "gemini_cli_model": "",
   "claude_model": "claude-opus-5",
   "whisper_server_url": "http://192.168.0.87:8178/inference",
+  "parakeet_server_url": "http://192.168.0.87:8179/inference",
+  "asr_backend": "whisper",
   "audio_lang": "auto",
   "audio_silence_sec": 0.6,
   "audio_max_chunk_sec": 6,

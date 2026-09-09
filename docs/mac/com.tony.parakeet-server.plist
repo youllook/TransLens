@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tony.parakeet-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tony/parakeet-venv/bin/python</string>
+        <string>/Users/tony/parakeet-server/parakeet_server.py</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8179</string>
+        <string>--preload</string>
+        <string>ja</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- parakeet-mlx 用 ffmpeg 解碼；launchd 不讀 shell profile，
+             PATH 沒有 /opt/homebrew/bin 就會丟 "FFmpeg is not installed"。 -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/tony/Library/Logs/parakeet-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tony/Library/Logs/parakeet-server.log</string>
+    <key>WorkingDirectory</key>
+    <string>/tmp</string>
+</dict>
+</plist>

@@ -1,0 +1,268 @@
+{
+  "seg5": {
+    "text": "うんとじゃあ次の問題は。",
+    "language": "ja",
+    "segments": [
+      {
+        "id": 0,
+        "start": 0.0,
+        "end": 4.88,
+        "text": " うんとじゃあ次の問題は。",
+        "words": [
+          {
+            "word": " うん",
+            "start": 0.0,
+            "end": 0.32,
+            "probability": 0.9768
+          },
+          {
+            "word": "と",
+            "start": 1.28,
+            "end": 1.6,
+            "probability": 0.9768
+          },
+          {
+            "word": "じゃあ",
+            "start": 1.92,
+            "end": 2.24,
+            "probability": 0.9768
+          },
+          {
+            "word": "次",
+            "start": 2.88,
+            "end": 3.2,
+            "probability": 0.9768
+          },
+          {
+            "word": "の",
+            "start": 3.52,
+            "end": 3.84,
+            "probability": 0.9768
+          },
+          {
+            "word": "問題",
+            "start": 3.84,
+            "end": 4.16,
+            "probability": 0.9768
+          },
+          {
+            "word": "は",
+            "start": 4.48,
+            "end": 4.8,
+            "probability": 0.9768
+          },
+          {
+            "word": "。",
+            "start": 4.8,
+            "end": 4.88,
+            "probability": 0.9768
+          }
+        ]
+      }
+    ]
+  },
+  "seg15": {
+    "text": "うんとじゃあ次の問題を山田また寝てるの!?廊下に立ってなさいほら早く。",
+    "language": "ja",
+    "segments": [
+      {
+        "id": 0,
+        "start": 0.0,
+        "end": 10.4,
+        "text": " うんとじゃあ次の問題を山田また寝てるの!",
+        "words": [
+          {
+            "word": " うん",
+            "start": 0.0,
+            "end": 0.32,
+            "probability": 0.986
+          },
+          {
+            "word": "と",
+            "start": 1.28,
+            "end": 1.6,
+            "probability": 0.986
+          },
+          {
+            "word": "じゃあ",
+            "start": 2.0,
+            "end": 2.32,
+            "probability": 0.986
+          },
+          {
+            "word": "次",
+            "start": 3.2,
+            "end": 3.52,
+            "probability": 0.986
+          },
+          {
+            "word": "の",
+            "start": 3.52,
+            "end": 3.84,
+            "probability": 0.986
+          },
+          {
+            "word": "問題",
+            "start": 3.84,
+            "end": 4.16,
+            "probability": 0.986
+          },
+          {
+            "word": "を",
+            "start": 4.8,
+            "end": 5.12,
+            "probability": 0.986
+          },
+          {
+            "word": "山",
+            "start": 7.36,
+            "end": 7.68,
+            "probability": 0.986
+          },
+          {
+            "word": "田",
+            "start": 7.68,
+            "end": 8.0,
+            "probability": 0.986
+          },
+          {
+            "word": "また",
+            "start": 8.96,
+            "end": 9.28,
+            "probability": 0.986
+          },
+          {
+            "word": "寝",
+            "start": 9.28,
+            "end": 9.52,
+            "probability": 0.986
+          },
+          {
+            "word": "て",
+            "start": 9.52,
+            "end": 9.68,
+            "probability": 0.986
+          },
+          {
+            "word": "る",
+            "start": 9.68,
+            "end": 9.84,
+            "probability": 0.986
+          },
+          {
+            "word": "の",
+            "start": 9.84,
+            "end": 10.16,
+            "probability": 0.986
+          },
+          {
+            "word": "!",
+            "start": 10.16,
+            "end": 10.4,
+            "probability": 0.986
+          }
+        ]
+      },
+      {
+        "id": 1,
+        "start": 10.4,
+        "end": 10.64,
+        "text": "?",
+        "words": [
+          {
+            "word": "?",
+            "start": 10.4,
+            "end": 10.64,
+            "probability": 0.9908
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "start": 10.96,
+        "end": 14.88,
+        "text": "廊下に立ってなさいほら早く。",
+        "words": [
+          {
+            "word": "廊",
+            "start": 10.96,
+            "end": 11.28,
+            "probability": 0.9983
+          },
+          {
+            "word": "下",
+            "start": 11.28,
+            "end": 11.44,
+            "probability": 0.9983
+          },
+          {
+            "word": "に",
+            "start": 11.44,
+            "end": 11.76,
+            "probability": 0.9983
+          },
+          {
+            "word": "立",
+            "start": 11.76,
+            "end": 11.84,
+            "probability": 0.9983
+          },
+          {
+            "word": "って",
+            "start": 11.84,
+            "end": 12.08,
+            "probability": 0.9983
+          },
+          {
+            "word": "な",
+            "start": 12.08,
+            "end": 12.24,
+            "probability": 0.9983
+          },
+          {
+            "word": "さ",
+            "start": 12.24,
+            "end": 12.56,
+            "probability": 0.9983
+          },
+          {
+            "word": "い",
+            "start": 12.56,
+            "end": 12.88,
+            "probability": 0.9983
+          },
+          {
+            "word": "ほ",
+            "start": 13.2,
+            "end": 13.52,
+            "probability": 0.9983
+          },
+          {
+            "word": "ら",
+            "start": 13.52,
+            "end": 13.68,
+            "probability": 0.9983
+          },
+          {
+            "word": "早",
+            "start": 14.0,
+            "end": 14.32,
+            "probability": 0.9983
+          },
+          {
+            "word": "く",
+            "start": 14.32,
+            "end": 14.64,
+            "probability": 0.9983
+          },
+          {
+            "word": "。",
+            "start": 14.64,
+            "end": 14.88,
+            "probability": 0.9983
+          }
+        ]
+      }
+    ]
+  }
+}
