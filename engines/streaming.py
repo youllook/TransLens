@@ -74,6 +74,10 @@ DEFAULTS = {
     # 多久送一次辨識。1.0 秒是延遲與請求數的折衷：這台 whisper 每次固定
     # 約 1.9 秒，間隔比它短只會讓請求塞車，比它長則延遲白白增加。
     "stream_interval_sec": 1.0,
+    # 標點以外的兩條斷句規則（Parakeet 幾乎不輸出標點，見 _maybe_flush）
+    "stream_flush_min_sec": 2.0,    # 已確定內容短於這個就不用停頓規則切
+    "stream_flush_gap_sec": 1.2,    # 字與字之間的空檔大於這個就算換句
+    "stream_flush_max_sec": 6.0,    # 已確定內容超過這麼長就先送出去
     # 緩衝上限。超過就強制 flush（見模組 docstring）。
     "stream_max_buffer_sec": 25.0,
     # 「這一秒完全沒人聲」的判定門檻。VAD 在串流模式只剩這個用途：
@@ -334,6 +338,12 @@ class StreamingSession:
                                               DEFAULTS["stream_agreement_n"])))
         self.min_commit_sec = float(cfg.get("stream_min_commit_sec",
                                             MIN_COMMIT_SEC))
+        self.flush_min_sec = float(cfg.get("stream_flush_min_sec",
+                                           DEFAULTS["stream_flush_min_sec"]))
+        self.flush_gap_sec = float(cfg.get("stream_flush_gap_sec",
+                                           DEFAULTS["stream_flush_gap_sec"]))
+        self.flush_max_sec = float(cfg.get("stream_flush_max_sec",
+                                           DEFAULTS["stream_flush_max_sec"]))
         self.reset()
 
     # --- 狀態
@@ -344,6 +354,7 @@ class StreamingSession:
         self._prev_norm = ""          # 上一次辨識結果的正規化字串（未確定的部分）
         self._committed = []          # 已確定的 _Token（本句）
         self._tentative = []          # 尚未確定的 _Token
+        self._grew = False            # 上一輪有沒有新確定的字（見 _maybe_flush）
         self.offset = 0.0             # 緩衝起點的絕對時間
         self._since_asr = 0           # 上次送辨識之後又進來多少 bytes
         self._sent_bytes = 0          # 已經送出過辨識的 bytes（due 判斷用）
@@ -457,6 +468,7 @@ class StreamingSession:
         # 這一輪的結果照樣存進 _prev_norm，所以緩衝一夠長，前面幾輪
         # 累積下來的一致性立刻就能用上，不會白等。
         if self.buffer_sec < self.min_commit_sec:
+            self._grew = False
             self._tentative = tokens[tail_token_start:]
             return {"committed": self.committed_text,
                     "tentative": self.tentative_text,
@@ -472,6 +484,8 @@ class StreamingSession:
         cut = max(tail_token_start, _word_safe_cut(tokens, cut))
 
         newly = tokens[tail_token_start:cut]
+        # 這一輪有沒有長出新字 —— 結尾標點要不要當真的依據（見 _maybe_flush）
+        self._grew = bool(newly)
         self._committed.extend(newly)
         self._tentative = tokens[cut:]
         # 尾巴確定掉的部分不該再參與下一輪比對
@@ -544,14 +558,54 @@ class StreamingSession:
 
     # --- flush
     def _maybe_flush(self):
-        """該把一句送出去嗎（句尾標點 / 緩衝上限）。"""
+        """該把一句送出去嗎（句尾標點 / 停頓 / 長度 / 緩衝上限）。
+
+        為什麼不能只靠標點：Parakeet 幾乎不輸出句尾標點（實測 15 秒的
+        四句對話只有最後一個「。」），只看標點的話緩衝會一路長到上限，
+        整段才被切出來，然後被幻聽過濾當成「太長太密」丟掉 —— 使用者
+        看到的就是「完全沒反應」。所以再加兩條與標點無關的切法：
+          停頓  已確定的字之間出現 flush_gap_sec 以上的空檔 = 換句了
+          長度  已確定的內容超過 flush_max_sec，就在最後一個字邊界切
+        """
         text = self.committed_text
         if text:
-            m = None
-            for m in _SENTENCE_END_RE.finditer(text):
-                pass
-            if m is not None:
+            # 找最後一個句尾標點。標點後面還有字 = 確定講完一句了，直接切。
+            #
+            # 標點剛好在結尾時要小心：Parakeet 每一輪都會在目前結果的尾巴
+            # 補一個「。」（實測 3s「うんとじゃあ。」→ 4s「うんとじゃあ次は。」
+            # → 5s「…問題は。」），那不是真的句尾。這種情況要等尾巴不再
+            # 成長（tentative 空、且這一輪沒有新確定的字）才切，否則會把
+            # 還在長的前綴一段段切出去，變成「とじゃあうんとじゃあ次の問題…」。
+            m = last_inner = None
+            for cand in _SENTENCE_END_RE.finditer(text):
+                m = cand
+                if cand.end() < len(text.rstrip()):
+                    last_inner = cand
+            if last_inner is not None:
+                return self._cut_at(last_inner.end())
+            # 標點落在已確定文字的結尾：後面還有未確定的尾巴在等，
+            # 代表講者已經講到下一句了，這個標點是真的句尾 → 切。
+            #
+            # 尾巴是空的時候不切。Parakeet 每一輪都會在目前結果的尾巴補
+            # 一個「。」（3s「うんとじゃあ。」→ 4s「…次は。」→ 5s「…問題は。」），
+            # 照著切會把還在成長的前綴一段段切出去，字幕變成
+            # 「とじゃあうんとじゃあ次の問題…」。真的講完停下來的話，
+            # 下一輪會由 stream_flush_max_sec（長度）或緩衝上限收掉，
+            # 頂多晚一輪，不會漏。
+            if m is not None and self._tentative:
                 return self._cut_at(m.end())
+
+        toks = self._committed
+        # 長度：已確定的內容夠長就先送出去，不要讓使用者一直等到緩衝上限。
+        #
+        # 這裡**不用「停頓」切句**：Parakeet 每一輪回報的時間戳會抖動
+        # （同一個「と」在相鄰兩輪分別是 1.28s 與 1.6s），假空檔會讓句子
+        # 被切得七零八落，scroll 之後殘留的 token 再與新結果疊在一起，
+        # 字幕就變成「とじゃあうんとじゃあ次の問題…」。長度規則不看空檔，
+        # 不受抖動影響。
+        if toks and (toks[-1].end - toks[0].start) >= self.flush_max_sec:
+            return self._cut_at(len(toks))
+
         if self.buffer_sec >= self.max_buffer_sec and self._committed:
             return self._cut_at(len(self._committed))
         return None

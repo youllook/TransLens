@@ -240,8 +240,9 @@ class TestFlush(unittest.TestCase):
         s = StreamingSession()
         s.add_audio(silence(5.0))
         self.assertAlmostEqual(s.buffer_sec, 5.0, places=2)
-        s.consume_result(words(("あ", 0.0, 2.0), ("。", 2.0, 2.5)))
-        s.consume_result(words(("あ", 0.0, 2.0), ("。", 2.0, 2.5)))
+        # 尾巴非空 = 講者已經講到下一句，尾端標點才算真的句尾（見 _maybe_flush）
+        s.consume_result(words(("あ", 0.0, 2.0), ("。", 2.0, 2.5), ("い", 2.6, 3.0)))
+        s.consume_result(words(("あ", 0.0, 2.0), ("。", 2.0, 2.5), ("い", 2.6, 3.0)))
         # 切在 2.5 秒 → 緩衝剩 2.5 秒、offset 前進 2.5
         self.assertAlmostEqual(s.buffer_sec, 2.5, places=2)
         self.assertAlmostEqual(s.offset, 2.5, places=2)
@@ -251,15 +252,18 @@ class TestFlush(unittest.TestCase):
         s = StreamingSession()
         s.add_audio(silence(10.0))
         for _ in range(2):
-            out = s.consume_result(words(("一句目", 0.0, 3.0), ("。", 3.0, 3.2)))
+            out = s.consume_result(words(("一句目", 0.0, 3.0), ("。", 3.0, 3.2),
+                                         ("二", 3.3, 3.5)))
         self.assertAlmostEqual(out["flush"].end, 3.2, places=3)
         # 第二句在 scroll 後的相對時間 0.0~2.0，絕對時間應是 3.2~5.2
         for _ in range(2):
-            out2 = s.consume_result(words(("二句目", 0.0, 2.0), ("。", 2.0, 2.1)))
+            out2 = s.consume_result(words(("二句目", 0.0, 2.0), ("。", 2.0, 2.1),
+                                          ("三", 2.2, 2.4)))
         cue2 = out2["flush"]
         self.assertIsNotNone(cue2)
         self.assertEqual(cue2.text, "二句目。")
-        self.assertAlmostEqual(cue2.start, 3.2, places=2)
+        # 3.3 而非 3.2：第一輪殘留的「二」從 3.3 開始，第二句由它接續
+        self.assertAlmostEqual(cue2.start, 3.3, places=2)
         self.assertAlmostEqual(cue2.end, 5.3, places=2)
 
     def test_max_buffer_triggers_flush(self):
@@ -351,8 +355,8 @@ class TestFallbacks(unittest.TestCase):
     def test_text_only_flush_has_timestamps(self):
         s = StreamingSession()
         s.add_audio(silence(4.0))
-        s.consume_result([], "はい。")
-        out = s.consume_result([], "はい。")
+        s.consume_result([], "はい。うん")
+        out = s.consume_result([], "はい。うん")
         cue = out["flush"]
         self.assertIsNotNone(cue)
         self.assertGreater(cue.end, 0.0)
