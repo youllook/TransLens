@@ -29,7 +29,7 @@
 run.bat
 ```
 
-就這樣。第一次執行會自動 `pip install pillow requests winsdk`，然後以 `pythonw` 無主控台啟動。
+就這樣。第一次執行會自動安裝相依套件（OCR 三件＋音訊字幕四件，約 70MB）並下載 2MB 的語音偵測模型，然後以 `pythonw` 無主控台啟動。
 之後直接雙擊 `run.bat` 或 `python translens.py` 都可以。
 
 需求：Windows 10/11、Python 3.10+。預設引擎用 Windows 內建 OCR（離線）＋ Google 翻譯（免金鑰），
@@ -167,7 +167,7 @@ LLM（本專案用 Mac mini 上的 [oMLX](https://github.com/jundot/omlx) 跑 Qw
 1. 一台跑 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) `whisper-server` 的機器（本專案用區網的 Mac mini M4）。
    安裝與 launchd 常駐設定見 [`docs/mac/README.md`](docs/mac/README.md)。
    同一台也可以跑 oMLX 提供本地翻譯（同上文件），不想自架就把 `translator` 設成 `google`。
-2. 這台 Windows 安裝擷取套件：`pip install pyaudiowpatch`
+2. 這台 Windows 的相依套件：`run.bat` 會自動裝齊（含 pyaudiowpatch、onnxruntime、numpy、opencc），手動的話 `pip install -r requirements.txt`
    （**沒裝不影響原本的 OCR 翻譯**，只是勾「🎧字幕」時會提示要安裝）。
 3. 這台 Windows 要有**啟用中的音訊輸出裝置**（喇叭或耳機）。loopback 是「錄下正在播放的聲音」，
    沒有輸出端點就沒有東西可錄。
@@ -498,7 +498,7 @@ returns nothing, it falls back to Google automatically and the status bar says s
    (this project uses a Mac mini M4 on the LAN). See [`docs/mac/README.md`](docs/mac/README.md)
    for the launchd service setup. The same box can host oMLX for local translation (same doc);
    set `translator` to `google` if you would rather not run one.
-2. `pip install pyaudiowpatch` on this Windows machine. **Without it, OCR translation is entirely unaffected** —
+2. Dependencies on this Windows machine: `run.bat` installs them all (pyaudiowpatch, onnxruntime, numpy, opencc); manually, `pip install -r requirements.txt`. **Without it, OCR translation is entirely unaffected** —
    ticking "🎧字幕" just tells you to install it.
 3. An **active audio output device** (speakers or headphones). Loopback records what is being *played*,
    so with no render endpoint there is nothing to capture.

@@ -1,13 +1,10 @@
 pillow>=10
 requests>=2.31
 winsdk>=1.0
+# 音訊字幕模式（run.bat 預設一起裝；缺任何一個字幕模式都會降級，所以不再列為選用）
+pyaudiowpatch>=0.2.12          # 擷取系統聲音（WASAPI loopback）
+onnxruntime>=1.17              # Silero VAD：分辨人聲與音樂，沒有它幻聽字幕會多很多
+numpy>=1.24
+opencc-python-reimplemented>=0.1.7   # 本地 LLM 譯文的簡→繁保底轉換
 # 選用：Claude 引擎
 # anthropic>=1.0
-# 選用：音訊字幕模式（擷取系統聲音）。沒裝不影響 OCR 翻譯，勾「🎧字幕」時才會用到。
-# pip install pyaudiowpatch
-# pyaudiowpatch>=0.2.12
-# 選用：Silero VAD（分辨人聲與音樂，大幅減少純 BGM 段落的幻聽字幕）。
-# 沒裝會自動退回能量式 VAD 並在狀態列標明。模型（約 2MB）第一次用到時自動下載。
-# 用 install_vad.bat 可一次裝好並預先抓模型。
-# onnxruntime>=1.17
-# numpy>=1.24
