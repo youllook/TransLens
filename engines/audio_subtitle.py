@@ -410,6 +410,7 @@ class AudioSubtitleWorker:
         self._stream_lang = None
         self._silence_run = 0.0       # 連續判定為靜音的秒數（省電開關用）
         self._asr_busy = threading.Event()   # 串流模式：辨識執行緒忙不忙
+        self._stream_pending = False         # 忙碌期間錯過的送出，忙完立刻補
 
     # --- 生命週期
     def start(self):
@@ -692,7 +693,9 @@ class AudioSubtitleWorker:
     def _stream_feed(self, pcm):
         """把 PCM 餵進 StreamingSession，時間到就排一次辨識。"""
         self.session.add_audio(pcm)
-        if not self.session.due():
+        # 「時間到」或「上一輪忙完後還欠一送」都要送
+        if not (self.session.due()
+                or (self._stream_pending and not self._asr_busy.is_set())):
             return
         if self._stream_is_silent():
             # 這一整段完全沒人聲：不送辨識，但也不丟掉音訊 ——
@@ -704,7 +707,12 @@ class AudioSubtitleWorker:
         # 那時再送一次就好。硬排只會讓延遲愈積愈大（實測會塞到丟輪次）。
         if self._asr_busy.is_set():
             self._silence_run = 0.0
+            # 標記「等它一做完就立刻再送一輪」。不這樣做的話，辨識回來時
+            # 還要再等一個完整 interval 才送下一輪，每一輪都白白多等一秒，
+            # 而 LocalAgreement 要兩輪一致才確定 —— 延遲會加倍。
+            self._stream_pending = True
             return
+        self._stream_pending = False
         wav = self.session.buffer_wav()
         prompt = self._stream_request_prompt()
         sec = self.session.buffer_sec
