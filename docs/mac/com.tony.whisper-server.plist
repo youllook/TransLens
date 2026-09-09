@@ -14,8 +14,7 @@
         <string>--port</string>
         <string>8178</string>
         <string>-t</string>
-        <string>4</string>
-        <string>--convert</string>
+        <string>6</string>
         <string>--tmp-dir</string>
         <string>/tmp</string>
     </array>
