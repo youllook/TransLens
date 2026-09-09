@@ -1,13 +1,16 @@
 @echo off
-rem TransLens 啟動器：缺套件就自動安裝，然後以無主控台方式啟動
+rem NOTE: keep rem lines ASCII-only and switch the console to UTF-8 first --
+rem       cmd otherwise parses the UTF-8 bytes of Chinese text as commands.
+chcp 65001 >nul
+rem TransLens launcher: install missing packages, then start without a console window.
 cd /d "%~dp0"
 python -c "import winsdk, PIL, requests, pyaudiowpatch, onnxruntime, numpy, opencc" 2>nul
 if errorlevel 1 (
     echo [TransLens] 安裝相依套件...
     python -m pip install -r requirements.txt
 )
-rem Silero VAD 模型（約 2MB）：沒有就先抓，讓第一次開字幕不用等。
-rem 抓不到會明講，字幕模式仍可用但會退回能量式 VAD（分不出音樂與人聲）。
+rem Silero VAD model (~2MB): fetch it up front so the first subtitle run does not wait.
+rem If the download fails we say so; subtitles still work with the energy-based VAD.
 if not exist "models\silero_vad.onnx" (
     echo [TransLens] 下載 Silero VAD 模型...
     python -c "from engines import vad; vad.ensure_model(progress=lambda d,t,s: None)" 2>nul
